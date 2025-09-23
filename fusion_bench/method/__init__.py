@@ -41,6 +41,7 @@ _import_structure = {
     "weighted_average": ["WeightedAverageAlgorithm", "WeightedAverageForLLama"],
     "task_arithmetic": ["TaskArithmeticAlgorithm"],
     "ties_merging": ["TiesMergingAlgorithm"],
+    "fastfood_merging": ["FastfoodSubspaceMergeAlgorithm"],
     "dare": ["DareSimpleAverage", "DareTaskArithmetic", "DareTiesMerging"],
     "fisher_merging": [
         "FisherMergingAlgorithm",
@@ -248,6 +249,7 @@ if TYPE_CHECKING:
     from .task_arithmetic import TaskArithmeticAlgorithm
     from .task_singular_vector import TaskSingularVectorMerging
     from .ties_merging import TiesMergingAlgorithm
+    from .fastfood_merging import FastfoodSubspaceMergeAlgorithm
     from .we_moe import (
         CLIPWeightEnsemblingMoEAlgorithm,
         FlanT5WeightEnsemblingMoEAlgorithm,

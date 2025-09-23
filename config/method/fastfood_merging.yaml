@@ -1,0 +1,17 @@
+_target_: fusion_bench.method.fastfood_merging.FastfoodSubspaceMergeAlgorithm
+proj_ratio: 0.10
+use_G: false
+device: "cuda"
+
+# New knobs to mirror your script:
+subspace_scope: "layer"   # per_tensor | layer | global
+merge_where: "subspace"        # subspace | postlift
+align_mode: "none"             # none | ties | tadrop
+merge_func: sum            # sum | mean | max   (zero-aware)
+ties_trim_pct: 0.0
+tadrop_tau: 0.0
+use_pareto: false
+use_rescale: false
+block_rows: 8192
+weights: null                  # e.g. [1,1,1,1,1,1,1,1]
+scale: 1.0

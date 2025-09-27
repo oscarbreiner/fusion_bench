@@ -40,6 +40,7 @@ _import_structure = {
     "simple_average": ["SimpleAverageAlgorithm"],
     "weighted_average": ["WeightedAverageAlgorithm", "WeightedAverageForLLama"],
     "task_arithmetic": ["TaskArithmeticAlgorithm"],
+    "emr_merging": ["EMRMergingAlgorithm"],
     "ties_merging": ["TiesMergingAlgorithm"],
     "fastfood_merging": ["FastfoodSubspaceMergeAlgorithm"],
     "dare": ["DareSimpleAverage", "DareTaskArithmetic", "DareTiesMerging"],

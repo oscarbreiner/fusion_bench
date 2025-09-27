@@ -1,0 +1,45 @@
+# EMR-Merging: Elect-Mask-Rescale Model Merging
+# 
+# Based on NeurIPS 2024 Spotlight Paper:
+# "EMR-Merging: Tuning-Free High-Performance Model Merging"
+# https://arxiv.org/abs/2405.17461
+#
+# The method consists of three steps:
+# 1. Elect: Determine unified direction from element-wise mean signs 
+#           and magnitude from maximum absolute values
+# 2. Mask: Create task-specific binary masks based on direction alignment
+# 3. Rescale: Apply task-specific rescaling factors to preserve magnitudes
+
+_target_: fusion_bench.method.emr_merging.EMRMergingAlgorithm
+
+# Whether to normalize task vectors before merging
+normalize: true
+
+# Merging mode:
+# - 'unified': Returns single merged model (average of task-specific vectors)
+# - 'separate': Returns list of task-specific models
+mode: unified
+
+# Optional weights for combining task-specific vectors in unified mode
+# If null, equal weighting is used
+weights: null
+
+# Example configurations:
+
+# Basic EMR merging (recommended):
+# _target_: fusion_bench.method.emr_merging.EMRMergingAlgorithm  
+# normalize: true
+# mode: unified
+# weights: null
+
+# Weighted EMR merging:
+# _target_: fusion_bench.method.emr_merging.EMRMergingAlgorithm
+# normalize: true  
+# mode: unified
+# weights: [0.4, 0.3, 0.2, 0.1]  # Custom weights for each task
+
+# Task-specific EMR models:
+# _target_: fusion_bench.method.emr_merging.EMRMergingAlgorithm
+# normalize: true
+# mode: separate
+# weights: null

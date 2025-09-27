@@ -1,0 +1,18 @@
+# TA2 Vision Subset: MNIST + EuroSAT
+# Simple digits + Satellite imagery (easy tasks for quick testing)
+defaults:
+  - /dataset/image_classification/train@train_datasets:
+      - mnist
+      - eurosat
+  - /dataset/image_classification/test@test_datasets:
+      - mnist
+      - eurosat
+  - _self_
+_target_: fusion_bench.modelpool.CLIPVisionModelPool
+_recursive_: False
+processor: openai/clip-vit-base-patch32
+models:
+  _pretrained_: openai/clip-vit-base-patch32
+  mnist: tanganke/clip-vit-base-patch32_mnist
+  eurosat: tanganke/clip-vit-base-patch32_eurosat
+platform: hf

@@ -1,0 +1,5 @@
+defaults:
+  - CLIPVisionModelTaskPool@: _template
+  - /dataset/image_classification/test@test_datasets:
+      - stanford-cars
+      - dtd

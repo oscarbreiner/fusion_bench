@@ -1,0 +1,24 @@
+# TA4 Balanced Subset: MNIST + EuroSAT + Stanford Cars + GTSRB (CLIP ViT-Large)
+# Diverse domains with larger model
+defaults:
+  - /dataset/image_classification/train@train_datasets:
+      - mnist
+      - eurosat
+      - stanford-cars
+      - gtsrb
+  - /dataset/image_classification/test@test_datasets:
+      - mnist
+      - eurosat
+      - stanford-cars
+      - gtsrb
+  - _self_
+_target_: fusion_bench.modelpool.CLIPVisionModelPool
+_recursive_: False
+processor: openai/clip-vit-large-patch14
+models:
+  _pretrained_: openai/clip-vit-large-patch14
+  mnist: tanganke/clip-vit-large-patch14_mnist
+  eurosat: tanganke/clip-vit-large-patch14_eurosat
+  stanford-cars: tanganke/clip-vit-large-patch14_stanford-cars
+  gtsrb: tanganke/clip-vit-large-patch14_gtsrb
+platform: hf

@@ -233,6 +233,10 @@ class LayerWiseAdaMergingAlgorithm(
                 with self.profile("data loading"):
                     batch = next(self.get_shuffled_test_loader_iter(task))
                 with self.profile("forward pass"):
+                    # Add safety check for batch
+                    if batch is None or len(batch) == 0:
+                        log.warning(f"Empty batch for task {task}, skipping")
+                        continue
                     logits = self.compute_logits(module, batch[0], task)
                     loss = entropy_loss(logits)
                 with self.profile("backward pass"):

@@ -1,0 +1,49 @@
+# Merged Model Analysis Configuration
+#
+# Comprehensive analysis of merged model weights compared to individual fine-tuned models.
+# Computes sign conflicts, L2 distance, and cosine similarity metrics.
+#
+# Metrics:
+# 1. Sign Conflicts: Element-wise comparison of weight signs (ratio of conflicting elements)  
+# 2. L2 Distance: Euclidean distance between flattened weight vectors
+# 3. Cosine Similarity: Cosine similarity between flattened weight vectors
+#
+# Supports all major merging methods:
+# - FastFood merging, EMR merging, Task Arithmetic, TIES merging, AdaMerging, Simple Average
+
+_target_: fusion_bench.method.analysis.merged_model_analysis.MergedModelAnalysis
+
+# List of merging methods to analyze
+merging_methods:
+  - "fastfood_merging"
+  - "emr_merging" 
+  - "task_arithmetic"
+  - "ties_merging"
+  - "adamerging"
+  - "simple_average"
+
+# Whether to only analyze trainable parameters (recommended for efficiency)
+trainable_only: true
+
+# Output directory for analysis results (null = use fabric logger directory)
+output_path: null
+
+# Whether to save detailed per-model results in addition to summary statistics
+save_individual_results: true
+
+# Example configurations:
+
+# Analyze specific methods only:
+# merging_methods:
+#   - "emr_merging"
+#   - "task_arithmetic" 
+#   - "ties_merging"
+
+# Include all parameters (not just trainable):
+# trainable_only: false
+
+# Custom output directory:
+# output_path: "/path/to/analysis/outputs"
+
+# Summary statistics only (no detailed per-model results):
+# save_individual_results: false

@@ -191,51 +191,70 @@ def _zero_aware_aggregate(
             out = out.masked_fill(all_zero, 0.0)
         return out
 
-    # ----- EMR: Elect → Mask → Rescale (repo-aligned) -----
-    # 1) Elect: sign from elementwise mean across donors; magnitude = max |·| among donors matching that sign
-    meanU = U.mean(dim=0)
-    gamma = meanU.sign()                           # {-1,0,+1} from mean sign
-    # donors that match elected sign (and gamma != 0)
-    match = (U * gamma.unsqueeze(0)) > 0
+    # ----- EMR: Elect → Mask → Rescale -----
+    # 1) Elect in a magnitude-aware way (closer to the paper):
+    #    sign = argmax over {pos,neg} of total |·| mass; magnitude = max |·| among donors with that sign.
+    # Total positive/negative magnitude per coord
+    pos_mass = (U.clamp_min(0.0)).sum(dim=0)          # sum of positive values (already >=0)
+    neg_mass = (-U.clamp_max(0.0)).sum(dim=0)         # sum of |negative| values
 
-    absU = U.abs()
+    dom_pos = pos_mass > neg_mass
+    dom_neg = neg_mass > pos_mass
+    tie_or_none = ~(dom_pos | dom_neg)
+
+    # Elected sign vector in {-1,0,+1}
+    gamma = torch.zeros_like(pos_mass).sign()  # zeros
+    gamma = torch.where(dom_pos, torch.ones_like(pos_mass), gamma)
+    gamma = torch.where(dom_neg, -torch.ones_like(pos_mass), gamma)
+
+    # Elected magnitude: max |U_k| among donors that match elected sign
+    # Build mask of donors that match elected sign
+    match_pos = (U > 0) & dom_pos.unsqueeze(0)
+    match_neg = (U < 0) & dom_neg.unsqueeze(0)
+    match = match_pos | match_neg
+
     masked_mag = absU.clone()
-    masked_mag[~match] = -float("inf")             # ignore non-matching donors in argmax
+    masked_mag[~match] = -float("inf")
+    idx_dom = masked_mag.argmax(dim=0)
 
-    idx_dom = masked_mag.argmax(dim=0)             # donor index with max |·| on elected sign
+    # If tie_or_none: there is no elected sign; magnitude = 0
     eps_uni = torch.gather(absU, dim=0, index=idx_dom.unsqueeze(0)).squeeze(0)
-    eps_uni = torch.where(gamma == 0, torch.zeros_like(eps_uni), eps_uni)
+    eps_uni = torch.where(tie_or_none, torch.zeros_like(eps_uni), eps_uni)
 
-    y_uni = gamma * eps_uni                        # unified elected vector (like repo's param_max * flag)
+    y_uni = gamma.sign() * eps_uni  # unified elected vector
 
-    # 2) Per-donor mask (direction alignment): Mi = 1 if donor agrees in sign with y_uni
-    Mi = ((U * y_uni.unsqueeze(0)) > 0)            # [K, ...] boolean
+    # 2) Mask per donor: Mi = 1 if donor agrees in sign with y_uni (and y_uni != 0)
+    # Broadcast y_uni across donor dimension
+    sign_y_uni = y_uni.sign()
+    Mi = ((U * y_uni.unsqueeze(0)) > 0)  # [K, ...] boolean
 
-    # 3) Per-donor rescale (magnitude alignment) using MEAN L1 (repo uses mean, not sum)
-    #    scales[m]     = mean(|param|)
-    #    new_scales[m] = mean(|y_uni * mask_m|)
-    num = absU.view(U.shape[0], -1).mean(dim=1)                        # [K]
-    den = (Mi.to(U.dtype) * y_uni.unsqueeze(0).abs()).view(U.shape[0], -1).mean(dim=1).clamp_min(1e-12)
-    lambdas = (num / den).to(U.dtype).view(U.shape[0], *([1] * (U.ndim - 1)))  # broadcastable
+    # 3) Rescale per donor: lambda_i = sum|U_i| / sum|Mi * y_uni|
+    # Guard against denom=0
+    num = absU.view(K, -1).sum(dim=1)  # [K]
+    den = (Mi * y_uni.unsqueeze(0).abs()).view(K, -1).sum(dim=1).clamp_min(1e-12)  # [K]
+    lambdas = (num / den).to(U.dtype).view(K, *([1] * (U.ndim - 1)))  # broadcastable
 
-    # Per-donor modulated vectors (repo reconstructs per-task; we combine to 1 vector for this pipeline)
-    mods = lambdas * (Mi.to(U.dtype) * y_uni.unsqueeze(0))             # [K, ..., M]
+    # Per-donor modulated vectors
+    mods = lambdas * (Mi.to(U.dtype) * y_uni.unsqueeze(0))  # [K, ..., M]
 
-    # Combine donors to a single merged vector (keep your existing weighting behavior)
+    # Combine to a single merged vector (weighted mean if weights provided; else mean)
     if weights is None:
         out = mods.mean(dim=0)
     else:
         w = torch.tensor(weights, dtype=U.dtype, device=U.device).view(
-            U.shape[0], *([1] * (U.ndim - 1))
+            K, *([1] * (U.ndim - 1))
         )
-        out = (w * mods).sum(dim=0)
+        out = (w * mods).sum(dim=0)  # weights were normalized upstream
 
-    # Force exact zero where all donors are zero
+    # If absolutely all donors were zero at a coord, force exact zero
     all_zero = (absU.sum(dim=0) == 0)
     if all_zero.any():
         out = out.masked_fill(all_zero, 0.0)
 
     return out
+
+
+
 
 def _layer_key(name: str) -> str:
     """Heuristic layer-grouping key (works for most HF models)."""

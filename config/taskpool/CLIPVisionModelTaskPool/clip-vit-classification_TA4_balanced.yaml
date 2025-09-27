@@ -1,0 +1,7 @@
+defaults:
+  - CLIPVisionModelTaskPool@: _template
+  - /dataset/image_classification/test@test_datasets:
+      - mnist
+      - eurosat
+      - stanford-cars
+      - gtsrb

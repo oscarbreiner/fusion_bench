@@ -1,0 +1,24 @@
+# TA4 Hard Subset: SUN397 + Stanford Cars + RESISC45 + DTD
+# Challenging tasks: scenes + cars + remote sensing + textures  
+defaults:
+  - /dataset/image_classification/train@train_datasets:
+      - sun397
+      - stanford-cars
+      - resisc45
+      - dtd
+  - /dataset/image_classification/test@test_datasets:
+      - sun397
+      - stanford-cars
+      - resisc45
+      - dtd
+  - _self_
+_target_: fusion_bench.modelpool.CLIPVisionModelPool
+_recursive_: False
+processor: openai/clip-vit-base-patch32
+models:
+  _pretrained_: openai/clip-vit-base-patch32
+  sun397: tanganke/clip-vit-base-patch32_sun397
+  stanford-cars: tanganke/clip-vit-base-patch32_stanford-cars
+  resisc45: tanganke/clip-vit-base-patch32_resisc45
+  dtd: tanganke/clip-vit-base-patch32_dtd
+platform: hf

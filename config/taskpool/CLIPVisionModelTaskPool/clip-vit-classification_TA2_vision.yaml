@@ -1,0 +1,23 @@
+# TA8 Subset Configurations for Sweeping
+# 
+# Available TA8 Tasks:
+# - sun397: Scene classification (397 categories)
+# - stanford-cars: Car classification (196 car models)
+# - resisc45: Remote sensing (45 scene categories) 
+# - eurosat: Satellite imagery (10 land use classes)
+# - svhn: Street View House Numbers (digit classification)
+# - gtsrb: German Traffic Sign Recognition (43 sign classes)
+# - mnist: Handwritten digits (10 classes)
+# - dtd: Describable Textures (47 texture categories)
+#
+# Subset Recommendations:
+# - TA2_VISION: mnist + eurosat (easy + satellite)
+# - TA2_COMPLEX: stanford-cars + dtd (complex objects + textures)
+# - TA4_BALANCED: mnist + eurosat + stanford-cars + gtsrb (diverse domains)
+# - TA4_HARD: sun397 + stanford-cars + resisc45 + dtd (challenging tasks)
+
+defaults:
+  - CLIPVisionModelTaskPool@: _template
+  - /dataset/image_classification/test@test_datasets:
+      - mnist
+      - eurosat

@@ -1,0 +1,18 @@
+# TA2 Complex Subset: Stanford Cars + DTD  
+# Complex object recognition + Texture classification
+defaults:
+  - /dataset/image_classification/train@train_datasets:
+      - stanford-cars
+      - dtd
+  - /dataset/image_classification/test@test_datasets:
+      - stanford-cars
+      - dtd
+  - _self_
+_target_: fusion_bench.modelpool.CLIPVisionModelPool
+_recursive_: False
+processor: openai/clip-vit-base-patch32
+models:
+  _pretrained_: openai/clip-vit-base-patch32
+  stanford-cars: tanganke/clip-vit-base-patch32_stanford-cars
+  dtd: tanganke/clip-vit-base-patch32_dtd
+platform: hf

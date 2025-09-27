@@ -1,0 +1,24 @@
+# TA4 Balanced Subset: MNIST + EuroSAT + Stanford Cars + GTSRB
+# Diverse domains: digits + satellite + cars + traffic signs
+defaults:
+  - /dataset/image_classification/train@train_datasets:
+      - mnist
+      - eurosat
+      - stanford-cars
+      - gtsrb
+  - /dataset/image_classification/test@test_datasets:
+      - mnist
+      - eurosat
+      - stanford-cars
+      - gtsrb
+  - _self_
+_target_: fusion_bench.modelpool.CLIPVisionModelPool
+_recursive_: False
+processor: openai/clip-vit-base-patch32
+models:
+  _pretrained_: openai/clip-vit-base-patch32
+  mnist: tanganke/clip-vit-base-patch32_mnist
+  eurosat: tanganke/clip-vit-base-patch32_eurosat
+  stanford-cars: tanganke/clip-vit-base-patch32_stanford-cars
+  gtsrb: tanganke/clip-vit-base-patch32_gtsrb
+platform: hf

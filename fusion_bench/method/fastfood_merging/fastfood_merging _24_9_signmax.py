@@ -116,7 +116,7 @@ def _zero_aware_aggregate(
 ) -> Tensor:
     """
     U: [K, ..., M] stacked donors in the chosen mixing space (subspace or postlift).
-    merge_func ∈ {'sum','mean','max','signmax','emr'}:
+    merge_func ∈ {'sum','mean','max','signmax'}:
       - 'sum'     : elementwise sum (weights optional)
       - 'mean'    : elementwise mean over *nonzero* contributors only (disentangled).
                     If weights given: (Σ w_k u_k 1[u_k!=0]) / (Σ w_k 1[u_k!=0])
@@ -124,15 +124,11 @@ def _zero_aware_aggregate(
       - 'signmax' : per position, pick the dominant sign across tasks (ignoring zeros),
                     then choose the largest |u_k| **with that sign**; on ties/no dominant
                     sign, fall back to 'max' behavior.
-      - 'emr'     : EMR-Merging (Elect → Mask → Rescale) producing a single merged vector:
-                    1) Elect sign by larger total |·| mass per sign; magnitude = max |·| on elected sign.
-                    2) For each donor i, mask to matching-sign coords; rescale to match L1 energy of τ_i.
-                    3) Combine masked+rescaled vectors (weighted mean if weights provided, else mean).
     """
     K = U.shape[0]
     mf = merge_func.lower()
-    if mf not in {"sum", "mean", "max", "signmax", "emr"}:
-        raise ValueError(f"merge_func={merge_func} not in {{'sum','mean','max','signmax','emr'}}")
+    if mf not in {"sum", "mean", "max", "signmax"}:
+        raise ValueError(f"merge_func={merge_func} not in {{'sum','mean','max','signmax'}}")
 
     if mf == "sum":
         if weights is None:
@@ -164,78 +160,41 @@ def _zero_aware_aggregate(
             out = out.masked_fill(all_zero, 0.0)
         return out
 
-    if mf == "signmax":
-        sgn = torch.sign(U)                 # {-1, 0, +1}
-        pos_count = (sgn > 0).sum(dim=0)
-        neg_count = (sgn < 0).sum(dim=0)
+    # mf == "signmax"
+    sgn = torch.sign(U)                 # {-1, 0, +1}
+    pos_count = (sgn > 0).sum(dim=0)
+    neg_count = (sgn < 0).sum(dim=0)
 
-        dom_pos = pos_count > neg_count     # positive majority
-        dom_neg = neg_count > pos_count     # negative majority
-        tie_or_none = ~(dom_pos | dom_neg)  # tie or all zeros
+    dom_pos = pos_count > neg_count     # has positive majority
+    dom_neg = neg_count > pos_count     # has negative majority
+    tie_or_none = ~(dom_pos | dom_neg)  # tie or all zeros
 
-        match_pos = (U > 0) & dom_pos.unsqueeze(0)
-        match_neg = (U < 0) & dom_neg.unsqueeze(0)
-        match = match_pos | match_neg
+    # Mask magnitudes to only those matching dominant sign (per element)
+    # Shape tricks: broadcast dom_* over donor dimension
+    match_pos = (U > 0) & dom_pos.unsqueeze(0)
+    match_neg = (U < 0) & dom_neg.unsqueeze(0)
+    match = match_pos | match_neg
 
-        masked_mag = absU.clone()
-        masked_mag[~match] = -float("inf")
-
-        idx_dom = masked_mag.argmax(dim=0)
-        idx_fallback = absU.argmax(dim=0)
-        idx = torch.where(tie_or_none, idx_fallback, idx_dom)
-
-        out = torch.gather(U, dim=0, index=idx.unsqueeze(0)).squeeze(0)
-
-        all_zero = (absU.sum(dim=0) == 0)
-        if all_zero.any():
-            out = out.masked_fill(all_zero, 0.0)
-        return out
-
-    # ----- EMR: Elect → Mask → Rescale (repo-aligned) -----
-    # 1) Elect: sign from elementwise mean across donors; magnitude = max |·| among donors matching that sign
-    meanU = U.mean(dim=0)
-    gamma = meanU.sign()                           # {-1,0,+1} from mean sign
-    # donors that match elected sign (and gamma != 0)
-    match = (U * gamma.unsqueeze(0)) > 0
-
-    absU = U.abs()
+    # Use -inf for non-matching entries so argmax ignores them
     masked_mag = absU.clone()
-    masked_mag[~match] = -float("inf")             # ignore non-matching donors in argmax
+    masked_mag[~match] = -float("inf")
 
-    idx_dom = masked_mag.argmax(dim=0)             # donor index with max |·| on elected sign
-    eps_uni = torch.gather(absU, dim=0, index=idx_dom.unsqueeze(0)).squeeze(0)
-    eps_uni = torch.where(gamma == 0, torch.zeros_like(eps_uni), eps_uni)
+    idx_dom = masked_mag.argmax(dim=0)  # index among matching sign donors
 
-    y_uni = gamma * eps_uni                        # unified elected vector (like repo's param_max * flag)
+    # Fallback: if tie/no dominant sign, behave like 'max'
+    idx_fallback = absU.argmax(dim=0)
+    idx = torch.where(tie_or_none, idx_fallback, idx_dom)
 
-    # 2) Per-donor mask (direction alignment): Mi = 1 if donor agrees in sign with y_uni
-    Mi = ((U * y_uni.unsqueeze(0)) > 0)            # [K, ...] boolean
+    out = torch.gather(U, dim=0, index=idx.unsqueeze(0)).squeeze(0)
 
-    # 3) Per-donor rescale (magnitude alignment) using MEAN L1 (repo uses mean, not sum)
-    #    scales[m]     = mean(|param|)
-    #    new_scales[m] = mean(|y_uni * mask_m|)
-    num = absU.view(U.shape[0], -1).mean(dim=1)                        # [K]
-    den = (Mi.to(U.dtype) * y_uni.unsqueeze(0).abs()).view(U.shape[0], -1).mean(dim=1).clamp_min(1e-12)
-    lambdas = (num / den).to(U.dtype).view(U.shape[0], *([1] * (U.ndim - 1)))  # broadcastable
-
-    # Per-donor modulated vectors (repo reconstructs per-task; we combine to 1 vector for this pipeline)
-    mods = lambdas * (Mi.to(U.dtype) * y_uni.unsqueeze(0))             # [K, ..., M]
-
-    # Combine donors to a single merged vector (keep your existing weighting behavior)
-    if weights is None:
-        out = mods.mean(dim=0)
-    else:
-        w = torch.tensor(weights, dtype=U.dtype, device=U.device).view(
-            U.shape[0], *([1] * (U.ndim - 1))
-        )
-        out = (w * mods).sum(dim=0)
-
-    # Force exact zero where all donors are zero
+    # If all donors are exactly zero at a position, force zero
     all_zero = (absU.sum(dim=0) == 0)
     if all_zero.any():
         out = out.masked_fill(all_zero, 0.0)
 
     return out
+
+
 
 def _layer_key(name: str) -> str:
     """Heuristic layer-grouping key (works for most HF models)."""

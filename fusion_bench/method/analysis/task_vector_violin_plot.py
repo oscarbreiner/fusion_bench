@@ -11,13 +11,16 @@ from numpy.typing import NDArray
 from torch import nn
 from tqdm.auto import tqdm
 
-from fusion_bench import BaseAlgorithm, BaseModelPool, StateDictType, timeit_context
+from fusion_bench.method import BaseAlgorithm
+from fusion_bench.modelpool import BaseModelPool  
+from fusion_bench.utils.parameters import StateDictType
+from fusion_bench.utils import timeit_context
 from fusion_bench.mixins import (
     LightningFabricMixin,
     SimpleProfilerMixin,
     auto_register_config,
 )
-from fusion_bench.utils import state_dict_to_vector, trainable_state_dict
+from fusion_bench.utils.parameters import state_dict_to_vector, trainable_state_dict
 from fusion_bench.utils.state_dict_arithmetic import state_dict_sub
 
 log = logging.getLogger(__name__)
@@ -60,8 +63,8 @@ class TaskVectorViolinPlot(
             uses the fabric logger's log directory. Defaults to None.
 
     Outputs:
-        - task_vector_violin.pdf: Violin plot of raw task vector value distributions
-        - task_vector_violin_abs.pdf: Violin plot of absolute task vector value distributions
+        - task_vector_violin_{method_name}.pdf: Violin plot of raw task vector value distributions
+        - task_vector_violin_abs_{method_name}.pdf: Violin plot of absolute task vector value distributions
 
     Returns:
         The pretrained model from the model pool.
@@ -95,6 +98,7 @@ class TaskVectorViolinPlot(
         max_points_per_model: Optional[int] = 1000,
         fig_kwawrgs=None,
         output_path: Optional[str] = None,
+        method_name: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -117,6 +121,8 @@ class TaskVectorViolinPlot(
             output_path (str, optional): Directory path where violin plots will be saved.
                 If None, uses the fabric logger's log directory. The directory will be
                 created if it doesn't exist. Defaults to None.
+            method_name (str, optional): Name of the merging method for file naming.
+                Prevents overwriting when analyzing multiple methods.
             **kwargs: Additional keyword arguments passed to parent classes.
 
         Note:
@@ -125,6 +131,10 @@ class TaskVectorViolinPlot(
         """
         super().__init__(**kwargs)
         self._output_path = output_path
+        self.trainable_only = trainable_only
+        self.max_points_per_model = max_points_per_model
+        self.fig_kwargs = fig_kwawrgs  # Note: keeping the typo for compatibility
+        self.method_name = method_name or "default"
 
     @property
     def output_path(self):
@@ -160,13 +170,13 @@ class TaskVectorViolinPlot(
 
         Side Effects:
             - Creates output directory if it doesn't exist
-            - Saves 'task_vector_violin.pdf' (raw values distribution)
-            - Saves 'task_vector_violin_abs.pdf' (absolute values distribution)
+            - Saves 'task_vector_violin_{method_name}.pdf' (raw values distribution)
+            - Saves 'task_vector_violin_abs_{method_name}.pdf' (absolute values distribution)
             - Prints progress information during task vector computation
 
         Example Output Files:
-            - task_vector_violin.pdf: Shows how parameters change (+ and -)
-            - task_vector_violin_abs.pdf: Shows magnitude of parameter changes
+            - task_vector_violin_{method_name}.pdf: Shows how parameters change (+ and -)
+            - task_vector_violin_abs_{method_name}.pdf: Shows magnitude of parameter changes
         """
         assert modelpool.has_pretrained
         pretrained_model = modelpool.load_pretrained_model()
@@ -205,7 +215,7 @@ class TaskVectorViolinPlot(
         # Adjust layout to prevent label cutoff and save plot
         plt.tight_layout()
         os.makedirs(self.output_path, exist_ok=True)
-        output_file = f"{self.output_path}/task_vector_violin.pdf"
+        output_file = f"{self.output_path}/task_vector_violin_{self.method_name}.pdf"
         plt.savefig(output_file, bbox_inches="tight")
         plt.close(fig)
 
@@ -232,7 +242,7 @@ class TaskVectorViolinPlot(
         # Adjust layout to prevent label cutoff and save plot
         plt.tight_layout()
         os.makedirs(self.output_path, exist_ok=True)
-        output_file = f"{self.output_path}/task_vector_violin_abs.pdf"
+        output_file = f"{self.output_path}/task_vector_violin_abs_{self.method_name}.pdf"
         plt.savefig(output_file, bbox_inches="tight")
         plt.close(fig)
 

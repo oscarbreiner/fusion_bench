@@ -191,11 +191,18 @@ class RegMeanAlgorithmPlusPlus(
                 for name in tqdm(
                     models_to_merge_dict.keys(), desc="computing input for first layer"
                 ):
-                    dataset = modelpool.load_train_dataset(name)
-
-                    batches_input_dict[name] = self.get_input_for_first_layer(
-                        merged_model, dataset
-                    )
+                    try:
+                        dataset = modelpool.load_train_dataset(name)
+                        if dataset is not None:
+                            batches_input_dict[name] = self.get_input_for_first_layer(
+                                merged_model, dataset
+                            )
+                        else:
+                            log.warning(f"No training dataset found for {name}, skipping RegMean++ merging")
+                            return merged_model  # Return base model if no training data
+                    except Exception as e:
+                        log.error(f"Failed to load training dataset for {name}: {e}")
+                        return merged_model  # Return base model if dataset loading fails
 
             # 2. iteratively merge layer by layer with regmean algorithm
             backbone_layers = self.get_layers(merged_model)

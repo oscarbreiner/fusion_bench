@@ -17,8 +17,8 @@ normalize: true
 
 # Merging mode:
 # - 'unified': Returns single merged model (average of task-specific vectors)
-# - 'separate': Returns list of task-specific models
-mode: unified
+# - 'separate': Returns list of task-specific models (RECOMMENDED for EMR evaluation)
+mode: separate
 
 # Optional weights for combining task-specific vectors in unified mode
 # If null, equal weighting is used

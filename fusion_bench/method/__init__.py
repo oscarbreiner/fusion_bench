@@ -41,6 +41,7 @@ _import_structure = {
     "weighted_average": ["WeightedAverageAlgorithm", "WeightedAverageForLLama"],
     "task_arithmetic": ["TaskArithmeticAlgorithm"],
     "emr_merging": ["EMRMergingAlgorithm"],
+    "enhanced_emr_merging": ["EMRMergingAlgorithmWithTaskEval", "TaskSpecificEvaluationWrapper"],
     "ties_merging": ["TiesMergingAlgorithm"],
     "fastfood_merging": ["FastfoodSubspaceMergeAlgorithm"],
     "dare": ["DareSimpleAverage", "DareTaskArithmetic", "DareTiesMerging"],

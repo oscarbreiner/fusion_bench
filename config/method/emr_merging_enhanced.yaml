@@ -1,0 +1,44 @@
+# EMR-Merging: Elect-Mask-Rescale Model Merging (Enhanced for Proper Evaluation)
+# 
+# Based on NeurIPS 2024 Spotlight Paper:
+# "EMR-Merging: Tuning-Free High-Performance Model Merging"
+# https://arxiv.org/abs/2405.17461
+#
+# This enhanced version ensures proper task-specific evaluation that matches
+# the original EMR paper's evaluation protocol.
+
+# Use the enhanced EMR algorithm with proper task-specific evaluation
+_target_: fusion_bench.method.enhanced_emr_merging.EMRMergingAlgorithmWithTaskEval
+
+# Whether to normalize task vectors before merging  
+normalize: true
+
+# Merging mode for enhanced evaluation:
+# - 'unified': Returns single merged model (standard fusion)
+# - 'separate': Returns list of task-specific models
+# - 'task_specific': Returns wrapper that automatically switches models per task (RECOMMENDED)
+mode: task_specific
+
+# Optional weights for combining task-specific vectors in unified mode
+# If null, equal weighting is used
+weights: null
+
+# Example configurations:
+
+# Proper EMR evaluation (RECOMMENDED - matches original paper):
+# _target_: enhanced_emr_merging.EMRMergingAlgorithmWithTaskEval
+# normalize: true
+# mode: task_specific
+# weights: null
+
+# Standard EMR unified model (for comparison with other methods):
+# _target_: enhanced_emr_merging.EMRMergingAlgorithmWithTaskEval  
+# normalize: true
+# mode: unified
+# weights: null
+
+# Manual task-specific models (for custom evaluation):
+# _target_: enhanced_emr_merging.EMRMergingAlgorithmWithTaskEval
+# normalize: true
+# mode: separate
+# weights: null

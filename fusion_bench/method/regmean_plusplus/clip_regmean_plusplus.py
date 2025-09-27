@@ -11,20 +11,18 @@ from torch.utils.data import DataLoader
 from tqdm.autonotebook import tqdm
 
 from fusion_bench.dataset.clip_dataset import CLIPDataset
-from fusion_bench.mixins import CLIPClassificationMixin
+from fusion_bench.mixins import CLIPClassificationMixin, auto_register_config
 
 from .regmean_plusplus import RegMeanAlgorithmPlusPlus
 
 log = logging.getLogger(__name__)
 
 
+@auto_register_config
 class RegMeanAlgorithmForCLIPPlusPlus(
     RegMeanAlgorithmPlusPlus,
     CLIPClassificationMixin,
 ):
-    _config_mapping = {
-        "_dataloader_kwargs": "dataloader_kwargs",
-    }
 
     def __init__(self, *, dataloader_kwargs: DictConfig, **kwargs):
         super().__init__(**kwargs)

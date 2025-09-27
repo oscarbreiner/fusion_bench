@@ -43,6 +43,12 @@ from fusion_bench.utils.parameters import (
 )
 from fusion_bench.utils.state_dict_arithmetic import state_dict_sub
 
+# Import TaskSpecificEvaluationWrapper for handling enhanced EMR task-specific analysis
+try:
+    from fusion_bench.method.enhanced_emr_merging import TaskSpecificEvaluationWrapper
+except ImportError:
+    TaskSpecificEvaluationWrapper = None
+
 log = logging.getLogger(__name__)
 
 
@@ -102,7 +108,7 @@ class MergedModelAnalysis(
         
         # Validate merging methods
         supported_methods = {
-            'fastfood_merging', 'emr_merging', 'task_arithmetic', 
+            'fastfood_merging', 'emr_merging', 'emr_merging_enhanced', 'task_arithmetic', 
             'ties_merging', 'adamerging', 'simple_average', 'regmean', 'regmean_plusplus'
         }
         for method in self.merging_methods:
@@ -138,6 +144,10 @@ class MergedModelAnalysis(
         Returns:
             Ratio of elements with conflicting signs (0.0 to 1.0)
         """
+        # Ensure tensors are on the same device
+        if merged_weights.device != individual_weights.device:
+            individual_weights = individual_weights.to(merged_weights.device)
+        
         # Get signs of weights
         merged_signs = torch.sign(merged_weights)
         individual_signs = torch.sign(individual_weights)
@@ -163,6 +173,10 @@ class MergedModelAnalysis(
         Returns:
             L2 distance between the weight vectors
         """
+        # Ensure tensors are on the same device
+        if merged_weights.device != individual_weights.device:
+            individual_weights = individual_weights.to(merged_weights.device)
+        
         return torch.norm(merged_weights - individual_weights, p=2).item()
 
     def _compute_cosine_similarity(self, merged_weights: torch.Tensor, individual_weights: torch.Tensor) -> float:
@@ -176,9 +190,118 @@ class MergedModelAnalysis(
         Returns:
             Cosine similarity between the weight vectors (-1.0 to 1.0)
         """
+        # Ensure tensors are on the same device
+        if merged_weights.device != individual_weights.device:
+            individual_weights = individual_weights.to(merged_weights.device)
+        
         # Compute cosine similarity directly (F.cosine_similarity handles normalization internally)
         similarity = F.cosine_similarity(merged_weights.unsqueeze(0), individual_weights.unsqueeze(0), dim=1)
         return similarity.item()
+
+    def _analyze_task_specific_method(
+        self, 
+        method_name: str,
+        task_wrapper: 'TaskSpecificEvaluationWrapper', 
+        individual_models: Dict[str, nn.Module]
+    ) -> Dict[str, Any]:
+        """
+        Analyze a task-specific method (Enhanced EMR with TaskSpecificEvaluationWrapper).
+        
+        Args:
+            method_name: Name of the merging method
+            task_wrapper: TaskSpecificEvaluationWrapper containing task-specific models
+            individual_models: Dictionary of individual fine-tuned models
+            
+        Returns:
+            Dictionary containing analysis results with task-specific breakdowns
+        """
+        log.info(f"Analyzing task-specific method: {method_name}")
+        
+        results = {
+            'method': method_name,
+            'task_specific_results': {},  # Per-task analysis
+            'individual_results': {},     # Overall individual results
+            'summary': {},
+            'task_summary': {}           # Per-task summaries
+        }
+        
+        all_sign_conflicts = []
+        all_l2_distances = []
+        all_cosine_similarities = []
+        
+        # Analyze each task-specific model against its corresponding individual model
+        for task_name, task_model in task_wrapper.task_models.items():
+            if task_name not in individual_models:
+                log.warning(f"Task '{task_name}' not found in individual models, skipping")
+                continue
+                
+            log.info(f"Analyzing task-specific model for task: {task_name}")
+            
+            # Get task-specific model weights  
+            task_state_dict = self._get_model_state_dict(task_model)
+            task_weights = self._flatten_state_dict(task_state_dict)
+            
+            # Get corresponding individual model weights
+            individual_model = individual_models[task_name]
+            individual_state_dict = self._get_model_state_dict(individual_model)
+            individual_weights = self._flatten_state_dict(individual_state_dict)
+            
+            # Ensure same device
+            target_device = task_weights.device
+            if individual_weights.device != target_device:
+                individual_weights = individual_weights.to(target_device)
+            
+            # Compute metrics for this specific task
+            sign_conflict = self._compute_sign_conflicts(task_weights, individual_weights)
+            l2_distance = self._compute_l2_distance(task_weights, individual_weights)
+            cosine_similarity = self._compute_cosine_similarity(task_weights, individual_weights)
+            
+            # Store task-specific results
+            results['task_specific_results'][task_name] = {
+                'sign_conflict_ratio': sign_conflict,
+                'l2_distance': l2_distance, 
+                'cosine_similarity': cosine_similarity
+            }
+            
+            # Also store in individual results for compatibility
+            results['individual_results'][task_name] = {
+                'sign_conflict_ratio': sign_conflict,
+                'l2_distance': l2_distance,
+                'cosine_similarity': cosine_similarity
+            }
+            
+            # Collect for overall averaging
+            all_sign_conflicts.append(sign_conflict)
+            all_l2_distances.append(l2_distance)
+            all_cosine_similarities.append(cosine_similarity)
+            
+            log.info(f"Task {task_name} - Sign conflicts: {sign_conflict:.4f}, "
+                    f"L2 distance: {l2_distance:.4f}, Cosine sim: {cosine_similarity:.4f}")
+        
+        # Compute overall summary statistics
+        if all_sign_conflicts:
+            results['summary'] = {
+                'avg_sign_conflict_ratio': np.mean(all_sign_conflicts),
+                'std_sign_conflict_ratio': np.std(all_sign_conflicts),
+                'avg_l2_distance': np.mean(all_l2_distances),
+                'std_l2_distance': np.std(all_l2_distances),
+                'avg_cosine_similarity': np.mean(all_cosine_similarities),
+                'std_cosine_similarity': np.std(all_cosine_similarities),
+                'num_models_analyzed': len(all_sign_conflicts)  # Use consistent key name
+            }
+            
+            # Per-task summary for detailed analysis
+            results['task_summary'] = {
+                'best_task_cosine_sim': max(all_cosine_similarities),
+                'worst_task_cosine_sim': min(all_cosine_similarities),
+                'best_task_l2_dist': min(all_l2_distances), 
+                'worst_task_l2_dist': max(all_l2_distances),
+                'task_performance_variance': np.var(all_cosine_similarities)
+            }
+            
+            log.info(f"Task-specific analysis complete - {len(all_sign_conflicts)} tasks analyzed")
+        
+        return results
 
     def _analyze_method(
         self, 
@@ -203,6 +326,10 @@ class MergedModelAnalysis(
         merged_state_dict = self._get_model_state_dict(merged_model)
         merged_weights = self._flatten_state_dict(merged_state_dict)
         
+        # Determine target device from merged model weights
+        target_device = merged_weights.device
+        log.debug(f"Target device for analysis: {target_device}")
+        
         results = {
             'method': method_name,
             'individual_results': {},
@@ -219,6 +346,11 @@ class MergedModelAnalysis(
             # Get individual model weights
             individual_state_dict = self._get_model_state_dict(individual_model)
             individual_weights = self._flatten_state_dict(individual_state_dict)
+            
+            # Ensure weights are on the same device as merged weights
+            if individual_weights.device != target_device:
+                log.debug(f"Moving {model_name} weights from {individual_weights.device} to {target_device}")
+                individual_weights = individual_weights.to(target_device)
             
             # Ensure same size (should be the case for same architecture)
             if merged_weights.shape != individual_weights.shape:
@@ -264,9 +396,91 @@ class MergedModelAnalysis(
         
         return results
 
+    def _analyze_emr_enhanced_method(
+        self,
+        method_name: str,
+        emr_wrapper,  # TaskSpecificEvaluationWrapper
+        individual_models: Dict[str, nn.Module]
+    ) -> Dict[str, Any]:
+        """
+        Analyze EMR Enhanced method with task-specific routing.
+        
+        For EMR Enhanced, we need to analyze each task-specific model against
+        its corresponding individual model, since EMR uses parameter routing.
+        
+        Args:
+            method_name: Name of the merging method (should be 'emr_merging_enhanced')
+            emr_wrapper: TaskSpecificEvaluationWrapper from Enhanced EMR
+            individual_models: Dictionary of individual fine-tuned models
+            
+        Returns:
+            Dictionary containing analysis results
+        """
+        log.info(f"Analyzing EMR Enhanced method: {method_name}")
+        
+        # Check if this is actually a TaskSpecificEvaluationWrapper
+        if TaskSpecificEvaluationWrapper and isinstance(emr_wrapper, TaskSpecificEvaluationWrapper):
+            log.info("Using task-specific analysis for Enhanced EMR")
+            return self._analyze_task_specific_method(method_name, emr_wrapper, individual_models)
+        else:
+            log.warning(f"EMR Enhanced expected TaskSpecificEvaluationWrapper, got {type(emr_wrapper)}")
+            # Fall back to regular analysis
+            return self._analyze_method(method_name, emr_wrapper, individual_models)
+
+    def _load_method_with_config(self, method_name: str):
+        """
+        Load method algorithm using actual Hydra configuration files.
+        
+        Args:
+            method_name: Name of the merging method
+            
+        Returns:
+            Instantiated algorithm or None if config not found
+        """
+        from omegaconf import OmegaConf
+        from fusion_bench.utils import instantiate
+        import os
+        
+        # Get the config path from the current environment
+        config_dir = None
+        for potential_config_dir in [
+            "config/method",  # Relative to current directory
+            "fusion_bench/config/method",  # Relative to repo root
+            os.path.join(os.path.dirname(__file__), "../../config/method"),  # Relative to this file
+            os.path.join(os.getcwd(), "fusion_bench/config/method"),  # From current working directory
+            "/dss/dsshome1/08/di97hih/fusion_merging/fusion_bench/config/method",  # Absolute path fallback
+        ]:
+            if os.path.exists(potential_config_dir):
+                config_dir = potential_config_dir
+                log.debug(f"Found config directory: {config_dir}")
+                break
+        
+        if config_dir is None:
+            log.warning(f"Could not find config directory for method {method_name}")
+            return None
+        
+        # Try to load the configuration file
+        config_file = os.path.join(config_dir, f"{method_name}.yaml")
+        if not os.path.exists(config_file):
+            log.warning(f"Config file not found: {config_file}")
+            return None
+            
+        try:
+            # Load the YAML configuration
+            config = OmegaConf.load(config_file)
+            log.info(f"Loading {method_name} with config: {OmegaConf.to_yaml(config)}")
+            
+            # Instantiate the algorithm using the configuration
+            algorithm = instantiate(config)
+            return algorithm
+            
+        except Exception as e:
+            log.warning(f"Failed to load config for {method_name}: {e}")
+            return None
+
     def _load_merged_model(self, method_name: str, modelpool: BaseModelPool) -> Optional[nn.Module]:
         """
-        Load a merged model using the specified method.
+        Load a merged model using the specified method with actual Hydra configuration.
         
         Args:
             method_name: Name of the merging method
@@ -276,126 +490,10 @@ class MergedModelAnalysis(
             Merged model or None if method not supported
         """
         try:
-            # Import the specific method
-            if method_name == 'fastfood_merging':
-                try:
-                    from fusion_bench.method.fastfood_merging import FastfoodSubspaceMergeAlgorithm
-                    # Use default parameters for analysis
-                    algorithm = FastfoodSubspaceMergeAlgorithm(
-                        proj_ratio=0.95,
-                        merge_func="signmax",
-                        align_mode="none"
-                    )
-                except ImportError:
-                    log.warning(f"FastfoodSubspaceMergeAlgorithm not found, skipping {method_name}")
-                    return None
-            elif method_name == 'emr_merging':
-                try:
-                    from fusion_bench.method.emr_merging import EMRMergingAlgorithm
-                    algorithm = EMRMergingAlgorithm(
-                        normalize=True,
-                        mode="unified"
-                    )
-                except ImportError:
-                    log.warning(f"EMRMergingAlgorithm not found, skipping {method_name}")
-                    return None
-            elif method_name == 'task_arithmetic':
-                from fusion_bench.method.task_arithmetic.task_arithmetic import TaskArithmeticAlgorithm
-                algorithm = TaskArithmeticAlgorithm(scaling_factor=1.0)
-            elif method_name == 'ties_merging':
-                try:
-                    from fusion_bench.method.ties_merging import TiesMergingAlgorithm
-                    algorithm = TiesMergingAlgorithm(
-                        scaling_factor=0.3,
-                        threshold=20,
-                        remove_keys=[],
-                        merge_func="sum"
-                    )
-                except ImportError:
-                    try:
-                        from fusion_bench.method.ties_merging.ties_merging import TiesMergingAlgorithm
-                        algorithm = TiesMergingAlgorithm(
-                            scaling_factor=0.3,
-                            threshold=20,
-                            remove_keys=[],
-                            merge_func="sum"
-                        )
-                    except ImportError:
-                        log.warning(f"TiesMergingAlgorithm not found, skipping {method_name}")
-                        return None
-            elif method_name == 'simple_average':
-                from fusion_bench.method.simple_average import SimpleAverageAlgorithm
-                algorithm = SimpleAverageAlgorithm()
-            elif method_name == 'adamerging':
-                try:
-                    from fusion_bench.method.adamerging.clip_layer_wise_adamerging import CLIPLayerWiseAdaMergingAlgorithm
-                    from omegaconf import DictConfig
-                    # Create minimal config for AdaMerging
-                    config = DictConfig({
-                        'weights': None,
-                        'optimizer': 'adam',
-                        'lr': 1e-3,
-                        'init_values': 0.3,
-                        'clamp_weights': False,
-                        'tie_weights': True,
-                        'strict': False,
-                        'devices': 1,
-                        'batch_size': 16,
-                        'num_workers': 8,
-                        'max_steps': 100,  # Reduced for faster analysis
-                        'fast_dev_run': False,
-                        'save_merging_weights': 'merging_weights.pt',
-                        'cache_dir': 'outputs'
-                    })
-                    algorithm = CLIPLayerWiseAdaMergingAlgorithm(algorithm_config=config)
-                except ImportError as e:
-                    log.warning(f"AdaMerging implementation not found for {method_name}: {e}")
-                    return None
-                except Exception as e:
-                    log.warning(f"Failed to initialize AdaMerging for {method_name}: {e}")
-                    return None
-            elif method_name == 'regmean':
-                try:
-                    from fusion_bench.method.regmean.clip_regmean import RegMeanAlgorithmForCLIP
-                    from omegaconf import DictConfig
-                    algorithm = RegMeanAlgorithmForCLIP(
-                        exclude_param_names_regex=[],
-                        num_regmean_examples=256,
-                        weight_transpose=True,
-                        reduce_non_diagonal_ratio=0.95,
-                        dataloader_kwargs=DictConfig({
-                            'batch_size': 32,
-                            'num_workers': 0
-                        })
-                    )
-                except ImportError as e:
-                    log.warning(f"RegMean implementation not found for {method_name}: {e}")
-                    return None
-                except Exception as e:
-                    log.warning(f"Failed to initialize RegMean for {method_name}: {e}")
-                    return None
-            elif method_name == 'regmean_plusplus':
-                try:
-                    from fusion_bench.method.regmean_plusplus.clip_regmean_plusplus import RegMeanAlgorithmForCLIPPlusPlus
-                    from omegaconf import DictConfig
-                    algorithm = RegMeanAlgorithmForCLIPPlusPlus(
-                        exclude_param_names_regex=[],
-                        num_regmean_examples=256,
-                        weight_transpose=True,
-                        reduce_non_diagonal_ratio=0.95,
-                        dataloader_kwargs=DictConfig({
-                            'batch_size': 32,
-                            'num_workers': 0
-                        })
-                    )
-                except ImportError as e:
-                    log.warning(f"RegMean++ implementation not found for {method_name}: {e}")
-                    return None
-                except Exception as e:
-                    log.warning(f"Failed to initialize RegMean++ for {method_name}: {e}")
-                    return None
-            else:
-                log.error(f"Unsupported merging method: {method_name}")
+            # Load the actual Hydra configuration for this method
+            algorithm = self._load_method_with_config(method_name)
+            if algorithm is None:
+                log.error(f"Failed to load algorithm for {method_name} using Hydra config")
                 return None
             
             log.info(f"Running {method_name} algorithm...")
@@ -417,6 +515,12 @@ class MergedModelAnalysis(
                 else:
                     log.error(f"Algorithm returned empty list for {method_name}")
                     return None
+                    
+            # Handle TaskSpecificEvaluationWrapper for enhanced EMR analysis
+            if TaskSpecificEvaluationWrapper and isinstance(merged_model, TaskSpecificEvaluationWrapper):
+                log.info(f"Detected task-specific model for {method_name}, enabling per-task analysis")
+                # Return the wrapper - we'll handle task-specific analysis in the main analysis loop
+                return merged_model
                     
             log.info(f"Successfully loaded merged model for {method_name}")
             return merged_model
@@ -470,8 +574,13 @@ class MergedModelAnalysis(
                 log.warning(f"Skipping {method_name} due to loading failure")
                 continue
             
-            # Analyze the method
-            method_results = self._analyze_method(method_name, merged_model, individual_models)
+            # Analyze the method - use specialized EMR analysis if needed
+            if method_name == 'emr_merging_enhanced':
+                # EMR Enhanced returns TaskSpecificEvaluationWrapper - needs special handling
+                method_results = self._analyze_emr_enhanced_method(method_name, merged_model, individual_models)
+            else:
+                # Standard analysis for other methods
+                method_results = self._analyze_method(method_name, merged_model, individual_models)
             all_results[method_name] = method_results
             
             # Add to summary data
@@ -525,7 +634,9 @@ class MergedModelAnalysis(
                 
                 if 'summary' in results and results['summary']:
                     summary = results['summary']
-                    f.write(f"Models analyzed: {summary['num_models_analyzed']}\n")
+                    # Handle both num_models_analyzed and num_tasks_analyzed
+                    num_analyzed = summary.get('num_models_analyzed', summary.get('num_tasks_analyzed', 'Unknown'))
+                    f.write(f"Models analyzed: {num_analyzed}\n")
                     f.write(f"Sign conflict ratio: {summary['avg_sign_conflict_ratio']:.4f} ± {summary['std_sign_conflict_ratio']:.4f}\n")
                     f.write(f"L2 distance: {summary['avg_l2_distance']:.4f} ± {summary['std_l2_distance']:.4f}\n")
                     f.write(f"Cosine similarity: {summary['avg_cosine_similarity']:.4f} ± {summary['std_cosine_similarity']:.4f}\n")

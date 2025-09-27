@@ -133,6 +133,15 @@ class EMRMergingAlgorithm(BaseModelFusionAlgorithm, SimpleProgressBarMixin):
                 merged_models.append(task_model)
                 
             log.info(f"EMR merging completed - {len(merged_models)} task-specific models created")
+            log.info(f"Model order: {model_names}")
+            
+            # Store task names for later reference
+            if hasattr(merged_models, '__task_names__'):
+                merged_models.__task_names__ = model_names
+            else:
+                # Add as attribute to first model for reference
+                merged_models[0].__emr_task_names__ = model_names
+                
             return merged_models
             
         else:

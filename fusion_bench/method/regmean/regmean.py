@@ -288,11 +288,12 @@ class RegMeanAlgorithm(
 
                 # exclude parameter whose name matches element in exclude_param_names_regex
                 if param_names_to_merge is None:
+                    # Provide safe defaults for config access
+                    config = getattr(self, 'config', None) or {}
+                    exclude_regex = config.get("exclude_param_names_regex", []) if hasattr(config, 'get') else []
                     param_names_to_merge = get_param_names_to_merge(
                         input_param_names=list(param_dict.keys()),
-                        exclude_param_names_regex=self.config.get(
-                            "exclude_param_names_regex", []
-                        ),
+                        exclude_param_names_regex=exclude_regex,
                     )
 
                 for param_name in param_names_to_merge:
@@ -319,11 +320,13 @@ class RegMeanAlgorithm(
 
         with self.profile("merging models"):
             # merging with regmean weights
+            config = getattr(self, 'config', None) or {}
+            weight_transpose = config.get("weight_transpose", True) if hasattr(config, 'get') else True
             merged_params = merging_with_regmean_weights(
                 models_to_merge_param_dict=models_to_merge_param_dict,
                 models_to_merge_regmean_weights_list=models_to_merge_regmean_weights_list,
                 reduce_non_diagonal_ratio=self.reduce_non_diagonal_ratio,
-                weight_transpose=self.config.get("weight_transpose", True),
+                weight_transpose=weight_transpose,
             )
 
             merged_model = modelpool.load_model("_pretrained_")

@@ -1,17 +1,57 @@
-_target_: fusion_bench.method.fastfood_merging.FastfoodSubspaceMergeAlgorithm
-proj_ratio: 0.75
-use_G: false
-device: "cuda"
+# ============================================================================
+# FastFood Subspace Merging Configuration
+# Supports multiple merging functions including EMA with adaptive β_t
+# ============================================================================
 
-# New knobs to mirror your script:
-subspace_scope: "global"   # per_tensor | layer | global
-merge_where: "subspace"        # subspace | postlift
-align_mode: "none"             # none | ties | tadrop
-merge_func: max            # sum | mean | max   (zero-aware)
-ties_trim_pct: 0.0
-tadrop_tau: 0.0
-use_pareto: false
-use_rescale: false
-block_rows: 8192
-weights: null                  # e.g. [1,1,1,1,1,1,1,1]
-scale: 1.0
+_target_: fusion_bench.method.fastfood_merging.FastfoodSubspaceMergeAlgorithm
+
+# ============================================================================
+# Core FastFood Parameters
+# ============================================================================
+proj_ratio: 0.75              # Subspace compression ratio (0.0-1.0)
+use_G: false                  # Use Gaussian scaling in FastFood transform
+device: "cuda"                # Computation device
+block_rows: 8192              # Memory management for large tensors
+
+# ============================================================================
+# Subspace Configuration
+# ============================================================================
+subspace_scope: "global"     # per_tensor | layer | global
+merge_where: "subspace"       # subspace | postlift
+
+# ============================================================================
+# Merging Strategy
+# ============================================================================
+merge_func: "max"             # sum | mean | max | signmax | ema
+align_mode: "none"            # none | ties | tadrop
+
+# ============================================================================
+# EMA Parameters (Active when merge_func="ema")
+# ============================================================================
+ema_task_order: "given"       # given | random | cosine_similarity | custom
+ema_gamma: 1.2                # Sigmoid scaling factor (0.5-2.0)
+ema_w_c: 0.6                  # Cosine alignment weight (0.0-1.0)
+ema_w_s: 0.4                  # Scale ratio weight (0.0-1.0, w_c + w_s = 1.0)
+ema_custom_order: 
+  - "SUN397"
+  - "Stanford-Cars" 
+  - "DTD"
+  - "GTSRB"
+  - "SVHN"
+  - "MNIST"
+  - "RESISC45"
+  - "EuroSAT"
+
+# ============================================================================
+# Advanced Alignment Options
+# ============================================================================
+ties_trim_pct: 0.0            # TIES pruning percentage (0.0-1.0)
+tadrop_tau: 0.0               # Task Arithmetic dropout threshold
+
+# ============================================================================
+# Post-processing Options
+# ============================================================================
+use_pareto: false             # Apply Pareto frontier optimization
+use_rescale: false            # Rescale merged parameters
+weights: null                 # Task importance weights [w1, w2, ..., wN]
+scale: 1.0                    # Global scaling factor

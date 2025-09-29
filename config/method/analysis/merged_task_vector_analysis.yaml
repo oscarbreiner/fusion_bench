@@ -1,0 +1,38 @@
+# Merged Task Vector Analysis Configuration
+# 
+# This configuration enables comprehensive analysis of merged task vectors
+# compared to individual task vectors in both original space and Fastfood subspace.
+#
+# Key differences from merged_model_analysis:
+# 1. Analyzes task vectors (parameter changes) instead of absolute model weights
+# 2. Includes Fastfood subspace projection and lift-back analysis
+# 3. Provides bounds checking for cosine similarity to detect bugs
+# 4. Supports both standard and Fastfood-specific merging methods
+
+_target_: fusion_bench.method.analysis.MergedTaskVectorAnalysis
+
+# Methods to analyze - specify which merging methods to evaluate
+merging_methods:
+  - "task_arithmetic"
+  - "fastfood_merging"
+  - "simple_average"
+  - "ties_merging"
+  - "emr_merging"
+
+# Fastfood subspace parameters (only used for fastfood_merging analysis)
+proj_ratio: 0.75  # Projection ratio for subspace dimensionality (0.0 to 1.0)
+use_G: false      # Whether to use diagonal scaling matrix G in Fastfood transform
+
+# Analysis parameters
+trainable_only: true              # Whether to only analyze trainable parameters
+save_individual_results: true     # Whether to save detailed per-task results
+plot_heatmaps: true              # Whether to generate visualization plots
+
+# Output configuration
+output_path: null  # Will use fabric logger directory if not specified
+
+# Device configuration
+device: "cuda"  # Device to run computations on ("cuda" or "cpu")
+
+# Advanced options
+_recursive_: false

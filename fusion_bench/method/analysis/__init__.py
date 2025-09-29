@@ -1,3 +1,4 @@
 from .task_vector_cos_similarity import TaskVectorCosSimilarity
 from .task_vector_violin_plot import TaskVectorViolinPlot
 from .merged_model_analysis import MergedModelAnalysis
+from .merged_task_vector_analysis import MergedTaskVectorAnalysis

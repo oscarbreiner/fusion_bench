@@ -111,12 +111,136 @@ def _fastfood_ops(
 
 # --------------- Zero-aware aggregation ----------------
 @torch.no_grad()
+def _ema_adaptive_beta(z_acc: Tensor, z_new: Tensor, gamma: float = 1.2, w_c: float = 0.6, w_s: float = 0.4, eps: float = 1e-8) -> float:
+    """
+    Compute adaptive β_t for EMA based on alignment and scale between accumulator and new task.
+    
+    Args:
+        z_acc: Current accumulator vector
+        z_new: New task vector to incorporate
+        gamma: Sigmoid scaling factor
+        w_c: Weight for cosine alignment term  
+        w_s: Weight for scale ratio term
+        eps: Small constant for numerical stability
+    
+    Returns:
+        β_t ∈ [0,1]: mixing coefficient for EMA update
+    """
+    if z_acc.norm() < eps:
+        return 0.0
+    
+    # Cosine alignment: how well z_new aligns with current accumulator
+    c = (z_acc @ z_new) / (z_acc.norm() * z_new.norm() + eps)
+    
+    # Scale ratio: relative magnitude of accumulator vs new task
+    s = z_acc.norm() / (z_new.norm() + eps)
+    
+    # Map to β via sigmoid (higher alignment & balanced scale → higher β)
+    beta = torch.sigmoid(gamma * (w_c * c + w_s * s))
+    return float(beta.item())
+
+
+@torch.no_grad()
+def _ema_merge_subspace(
+    U: Tensor, 
+    task_order: str = "given", 
+    ema_gamma: float = 1.2,
+    ema_w_c: float = 0.6, 
+    ema_w_s: float = 0.4,
+    weights: List[float] | None = None,
+    custom_order: List[int] | None = None
+) -> Tensor:
+    """
+    EMA merging in subspace with adaptive β_t.
+    
+    Args:
+        U: [K, ..., M] stacked task vectors in subspace
+        task_order: "given" | "random" | "cosine_similarity" | "custom"
+        ema_gamma, ema_w_c, ema_w_s: EMA adaptive β parameters
+        weights: Task importance weights (applied as scaling)
+        custom_order: List of task indices when task_order="custom" (e.g., [2,0,1] to process tasks in that order)
+    
+    Returns:
+        Merged vector in subspace
+    """
+    K = U.shape[0]
+    if K == 0:
+        raise ValueError("No task vectors to merge")
+    if K == 1:
+        w = weights[0] if weights else 1.0
+        return w * U[0]
+    
+    # Flatten for easier processing
+    orig_shape = U.shape[1:]
+    U_flat = U.view(K, -1)  # [K, numel]
+    
+    # Determine processing order
+    if task_order == "random":
+        indices = torch.randperm(K).tolist()
+    elif task_order == "custom":
+        if custom_order is None:
+            raise ValueError("custom_order must be provided when task_order='custom'")
+        if len(custom_order) != K or set(custom_order) != set(range(K)):
+            raise ValueError(f"custom_order must be a permutation of [0,1,...,{K-1}], got {custom_order}")
+        indices = custom_order
+    elif task_order == "cosine_similarity":
+        # Start with first, then order remaining by cosine similarity to current accumulator
+        indices = [0]
+        z_acc = U_flat[0].clone()
+        remaining = set(range(1, K))
+        
+        while remaining:
+            # Find task most similar to current accumulator
+            best_idx = None
+            best_sim = -2.0  # cosine ∈ [-1,1]
+            
+            for idx in remaining:
+                z_cand = U_flat[idx]
+                if z_acc.norm() > 1e-8 and z_cand.norm() > 1e-8:
+                    sim = (z_acc @ z_cand) / (z_acc.norm() * z_cand.norm())
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_idx = idx
+            
+            if best_idx is not None:
+                indices.append(best_idx)
+                remaining.remove(best_idx)
+                # Update accumulator for next iteration (simple average so far)
+                z_acc = torch.stack([U_flat[i] for i in indices]).mean(dim=0)
+            else:
+                # Fallback: just take first remaining
+                best_idx = next(iter(remaining))
+                indices.append(best_idx)
+                remaining.remove(best_idx)
+    else:  # "given"
+        indices = list(range(K))
+    
+    # EMA streaming update
+    z_acc = torch.zeros_like(U_flat[0])
+    
+    for i, task_idx in enumerate(indices):
+        z_new = U_flat[task_idx]
+        
+        # Apply task weight if provided
+        if weights is not None:
+            z_new = weights[task_idx] * z_new
+        
+        # Adaptive β based on current accumulator and new task
+        beta = _ema_adaptive_beta(z_acc, z_new, ema_gamma, ema_w_c, ema_w_s)
+        
+        # EMA update: z_acc = β * z_acc + (1-β) * z_new
+        z_acc = beta * z_acc + (1 - beta) * z_new
+    
+    return z_acc.view(orig_shape)
+
+
+@torch.no_grad()
 def _zero_aware_aggregate(
-    U: Tensor, merge_func: str, weights: List[float] | None
+    U: Tensor, merge_func: str, weights: List[float] | None, **kwargs
 ) -> Tensor:
     """
     U: [K, ..., M] stacked donors in the chosen mixing space (subspace or postlift).
-    merge_func ∈ {'sum','mean','max','signmax','emr'}:
+    merge_func ∈ {'sum','mean','max','signmax','ema'}:
       - 'sum'     : elementwise sum (weights optional)
       - 'mean'    : elementwise mean over *nonzero* contributors only (disentangled).
                     If weights given: (Σ w_k u_k 1[u_k!=0]) / (Σ w_k 1[u_k!=0])
@@ -124,15 +248,26 @@ def _zero_aware_aggregate(
       - 'signmax' : per position, pick the dominant sign across tasks (ignoring zeros),
                     then choose the largest |u_k| **with that sign**; on ties/no dominant
                     sign, fall back to 'max' behavior.
-      - 'emr'     : EMR-Merging (Elect → Mask → Rescale) producing a single merged vector:
-                    1) Elect sign by larger total |·| mass per sign; magnitude = max |·| on elected sign.
-                    2) For each donor i, mask to matching-sign coords; rescale to match L1 energy of τ_i.
-                    3) Combine masked+rescaled vectors (weighted mean if weights provided, else mean).
+      - 'ema'     : Exponential Moving Average with adaptive β_t based on alignment & scale.
+                    Processes tasks sequentially with order-dependent results.
+                    Task ordering: "given" (modelpool order), "random" (shuffle), 
+                    "cosine_similarity" (similar tasks first), "custom" (user-specified order)
     """
     K = U.shape[0]
     mf = merge_func.lower()
-    if mf not in {"sum", "mean", "max", "signmax", "emr"}:
-        raise ValueError(f"merge_func={merge_func} not in {{'sum','mean','max','signmax','emr'}}")
+    if mf not in {"sum", "mean", "max", "signmax", "ema"}:
+        raise ValueError(f"merge_func={merge_func} not in {{'sum','mean','max','signmax','ema'}}")
+
+    if mf == "ema":
+        return _ema_merge_subspace(
+            U, 
+            task_order=kwargs.get("ema_task_order", "given"),
+            ema_gamma=kwargs.get("ema_gamma", 1.2),
+            ema_w_c=kwargs.get("ema_w_c", 0.6),
+            ema_w_s=kwargs.get("ema_w_s", 0.4),
+            weights=weights,
+            custom_order=kwargs.get("ema_custom_order", None)
+        )
 
     if mf == "sum":
         if weights is None:
@@ -191,52 +326,6 @@ def _zero_aware_aggregate(
             out = out.masked_fill(all_zero, 0.0)
         return out
 
-    # ----- EMR: Elect → Mask → Rescale (repo-aligned) -----
-    # 1) Elect: sign from elementwise mean across donors; magnitude = max |·| among donors matching that sign
-    meanU = U.mean(dim=0)
-    gamma = meanU.sign()                           # {-1,0,+1} from mean sign
-    # donors that match elected sign (and gamma != 0)
-    match = (U * gamma.unsqueeze(0)) > 0
-
-    absU = U.abs()
-    masked_mag = absU.clone()
-    masked_mag[~match] = -float("inf")             # ignore non-matching donors in argmax
-
-    idx_dom = masked_mag.argmax(dim=0)             # donor index with max |·| on elected sign
-    eps_uni = torch.gather(absU, dim=0, index=idx_dom.unsqueeze(0)).squeeze(0)
-    eps_uni = torch.where(gamma == 0, torch.zeros_like(eps_uni), eps_uni)
-
-    y_uni = gamma * eps_uni                        # unified elected vector (like repo's param_max * flag)
-
-    # 2) Per-donor mask (direction alignment): Mi = 1 if donor agrees in sign with y_uni
-    Mi = ((U * y_uni.unsqueeze(0)) > 0)            # [K, ...] boolean
-
-    # 3) Per-donor rescale (magnitude alignment) using MEAN L1 (repo uses mean, not sum)
-    #    scales[m]     = mean(|param|)
-    #    new_scales[m] = mean(|y_uni * mask_m|)
-    num = absU.view(U.shape[0], -1).mean(dim=1)                        # [K]
-    den = (Mi.to(U.dtype) * y_uni.unsqueeze(0).abs()).view(U.shape[0], -1).mean(dim=1).clamp_min(1e-12)
-    lambdas = (num / den).to(U.dtype).view(U.shape[0], *([1] * (U.ndim - 1)))  # broadcastable
-
-    # Per-donor modulated vectors (repo reconstructs per-task; we combine to 1 vector for this pipeline)
-    mods = lambdas * (Mi.to(U.dtype) * y_uni.unsqueeze(0))             # [K, ..., M]
-
-    # Combine donors to a single merged vector (keep your existing weighting behavior)
-    if weights is None:
-        out = mods.mean(dim=0)
-    else:
-        w = torch.tensor(weights, dtype=U.dtype, device=U.device).view(
-            U.shape[0], *([1] * (U.ndim - 1))
-        )
-        out = (w * mods).sum(dim=0)
-
-    # Force exact zero where all donors are zero
-    all_zero = (absU.sum(dim=0) == 0)
-    if all_zero.any():
-        out = out.masked_fill(all_zero, 0.0)
-
-    return out
-
 def _layer_key(name: str) -> str:
     """Heuristic layer-grouping key (works for most HF models)."""
     parts = name.split(".")
@@ -256,12 +345,20 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
     Controls:
       subspace_scope: "per_tensor" | "layer" | "global"
       merge_where:    "subspace" | "postlift"
-      merge_func:     "sum" | "mean" | "max" | "signmax"  (zero-aware & disentangled)
+      merge_func:     "sum" | "mean" | "max" | "signmax" | "ema"  (zero-aware & disentangled)
       proj_ratio:     float (0..1)
       use_G:          bool
       block_rows:     int
       weights:        list[float] (donor weights; normalized internally)
       scale:          float (post-merge scale on Δ*)
+      
+      # EMA-specific parameters (when merge_func="ema"):
+      ema_task_order: "given" | "random" | "cosine_similarity" | "custom"
+      ema_gamma:      float (sigmoid scaling factor, default 1.2)
+      ema_w_c:        float (cosine alignment weight, default 0.6)
+      ema_w_s:        float (scale ratio weight, default 0.4)
+      ema_custom_order: list[str] (task names in desired order, when ema_task_order="custom")
+      
       ties_trim_pct, tadrop_tau, use_pareto: kept for API compatibility (unused)
     """
 
@@ -272,10 +369,16 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         device: str = "cuda",
         subspace_scope: str = "global",  # "per_tensor" | "layer" | "global"
         merge_where: str = "subspace",   # "subspace" | "postlift"
-        merge_func: str = "sum",         # "sum" | "mean" | "max" | "signmax"
+        merge_func: str = "sum",         # "sum" | "mean" | "max" | "signmax" | "ema"
         block_rows: int = 8192,
         weights: List[float] | None = None,
         scale: float = 1.0,
+        # EMA-specific parameters
+        ema_task_order: str = "given",   # "given" | "random" | "cosine_similarity" | "custom"
+        ema_gamma: float = 1.2,          # sigmoid scaling factor
+        ema_w_c: float = 0.6,            # cosine alignment weight
+        ema_w_s: float = 0.4,            # scale ratio weight
+        ema_custom_order: List[str] | None = None,  # task names in desired order (when ema_task_order="custom")
         # Kept in signature for compatibility (not used since align logic removed)
         ties_trim_pct: float = 0.0,
         tadrop_tau: float = 0.0,
@@ -293,6 +396,13 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self.block_rows = int(block_rows)
         self.weights = list(weights) if weights is not None else None
         self.scale = float(scale)
+        
+        # EMA parameters
+        self.ema_task_order = str(ema_task_order)
+        self.ema_gamma = float(ema_gamma)
+        self.ema_w_c = float(ema_w_c)
+        self.ema_w_s = float(ema_w_s)
+        self.ema_custom_order = list(ema_custom_order) if ema_custom_order is not None else None
 
     # ------------------- main -------------------
     @torch.no_grad()
@@ -338,6 +448,27 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             s = sum(self.weights) + EPS
             w = [wi / s for wi in self.weights]
 
+        # ---------- EMA Custom Order Mapping ----------
+        ema_custom_indices = None
+        if self.merge_func == "ema" and self.ema_task_order == "custom":
+            if self.ema_custom_order is None:
+                raise ValueError("ema_custom_order must be provided when ema_task_order='custom'")
+            
+            # Map task names to indices
+            name_to_idx = {name: i for i, name in enumerate(donor_names)}
+            try:
+                ema_custom_indices = [name_to_idx[task_name] for task_name in self.ema_custom_order]
+            except KeyError as e:
+                available_names = list(donor_names)
+                raise ValueError(f"Task name {e} in ema_custom_order not found in donor names. Available: {available_names}")
+            
+            if len(ema_custom_indices) != K:
+                raise ValueError(f"ema_custom_order must include all {K} tasks, got {len(ema_custom_indices)}")
+            if set(ema_custom_indices) != set(range(K)):
+                raise ValueError(f"ema_custom_order must be a permutation of all task indices, got {ema_custom_indices}")
+            
+            print(f"[EMA] Custom task order: {self.ema_custom_order} -> indices {ema_custom_indices}")
+
         # ---------- Seed scoping ----------
         def proj_seed_key(param_name: str) -> str:
             if self.subspace_scope == "global":
@@ -368,6 +499,10 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             print("[Dims] scope={} | proj_ratio={:.3f} | examples:".format(self.subspace_scope, self.proj_ratio))
             for (D, m), k in dims:
                 print(f"   - {k}: original_last_dim={int(base_sd[k].shape[-1])} | scoped_dim={D} → proj_dim={m} (compression={m/max(1,D):.3f})")
+        
+        # Show EMA parameters if using EMA
+        if self.merge_func == "ema":
+            print(f"[EMA] task_order={self.ema_task_order} | gamma={self.ema_gamma:.3f} | w_c={self.ema_w_c:.3f} | w_s={self.ema_w_s:.3f}")
 
         # ---------- Work on CPU copies ----------
         base_cpu = {k: v.detach().cpu().clone() for k, v in base_sd.items()}
@@ -439,7 +574,12 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         Xmerge = _zero_aware_aggregate(
                             U_stack,
                             merge_func=self.merge_func,
-                            weights=w if self.merge_func in {"sum", "mean"} else None,
+                            weights=w if self.merge_func in {"sum", "mean", "ema"} else None,
+                            ema_task_order=self.ema_task_order,
+                            ema_gamma=self.ema_gamma,
+                            ema_w_c=self.ema_w_c,
+                            ema_w_s=self.ema_w_s,
+                            ema_custom_order=ema_custom_indices,
                         ).to("cpu", non_blocking=True)
                     else:
                         # aggregate in subspace, then lift once
@@ -447,7 +587,12 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         Ymerge = _zero_aware_aggregate(
                             U_stack,
                             merge_func=self.merge_func,
-                            weights=w if self.merge_func in {"sum", "mean"} else None,
+                            weights=w if self.merge_func in {"sum", "mean", "ema"} else None,
+                            ema_task_order=self.ema_task_order,
+                            ema_gamma=self.ema_gamma,
+                            ema_w_c=self.ema_w_c,
+                            ema_w_s=self.ema_w_s,
+                            ema_custom_order=ema_custom_indices,
                         )
                         Xmerge_full = lift(Ymerge).to("cpu", non_blocking=True)  # [take, cur_D]
                         Xmerge = Xmerge_full[:, :d_last]

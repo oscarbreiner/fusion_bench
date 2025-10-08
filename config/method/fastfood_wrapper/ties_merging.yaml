@@ -1,0 +1,21 @@
+# ============================================================================
+# FastFood Wrapper - TIES Merging Configuration
+# Projects to subspace, applies native TIES algorithm, lifts back
+# Full TIES implementation: TRIM + ELECT + DISJOINT MERGE in subspace
+# ============================================================================
+
+_target_: fusion_bench.method.fastfood_wrapper.FastfoodWrapperAlgorithm
+
+# Core FastFood projection parameters
+proj_ratio: 0.75              # Compression ratio (0.0-1.0)
+use_G: false                  # Use Gaussian scaling in FastFood
+device: "cuda"                # Computation device
+subspace_scope: "layer"       # per_tensor | layer | global
+
+# Merging configuration  
+merging_method: "ties_merging"
+method_config:
+  scaling_factor: 0.3         # Task vector scaling factor
+  threshold: 20               # TIES threshold (fallback to task arithmetic)
+  merge_func: "sum"           # Merge function
+  remove_keys: []             # Keys to exclude

@@ -1,0 +1,66 @@
+# Enhanced Task Vector Layer-wise Analysis Configuration
+# 
+# This configuration enables comprehensive layer-wise analysis of task vectors,
+# providing deep insights into how different layers behave during model merging.
+# 
+# NEW FEATURES:
+# - Attention vs MLP component analysis
+# - Early/Middle/Late layer grouping  
+# - Layer capacity and importance weighting
+# - Cross-layer correlation analysis
+# - Gradient flow and optimization landscape analysis
+
+_target_: fusion_bench.method.analysis.TaskVectorLayerAnalysis
+
+# Core Analysis Parameters
+trainable_only: true              # Whether to only analyze trainable parameters
+method_name: "enhanced_layer"     # Method name for output file naming
+
+# Layer Grouping and Analysis Depth
+analyze_attention_mlp_separately: true    # Separate analysis for attention vs MLP components
+analyze_layer_groups: true               # Group layers into Early/Middle/Late for analysis
+layer_group_strategy: "thirds"           # "thirds", "quartiles", "custom"
+custom_layer_groups: null               # Custom layer groupings if strategy is "custom"
+
+# Advanced Metrics
+compute_layer_importance: true           # Compute parameter importance per layer
+compute_gradient_flow_proxy: true       # Analyze gradient flow characteristics  
+compute_cross_layer_correlations: true  # Analyze correlations between layers
+compute_capacity_metrics: true          # Analyze layer capacity and utilization
+
+# Attention-Specific Analysis (for Transformer models)
+attention_head_analysis: true           # Analyze individual attention heads
+analyze_qkv_separately: true           # Separate Q, K, V analysis in attention
+position_encoding_analysis: true       # Special analysis for positional components
+
+# Statistical Analysis
+compute_statistical_tests: true        # Run statistical significance tests
+confidence_level: 0.95                # Confidence level for statistical tests
+bootstrap_samples: 1000               # Number of bootstrap samples for robust statistics
+
+# Visualization Options
+create_detailed_plots: true           # Create comprehensive visualization suite
+plot_correlation_matrices: true      # Plot cross-layer correlation matrices
+plot_importance_distributions: true   # Plot layer importance distributions
+plot_gradient_flow: true             # Plot gradient flow characteristics
+save_individual_layer_plots: true    # Save separate plots for each layer group
+
+# Performance Options  
+max_layers_for_detailed_analysis: 48  # Limit detailed analysis for very deep models
+subsample_parameters: true           # Subsample parameters for memory efficiency
+max_parameters_per_layer: 10000     # Max parameters to analyze per layer (if subsampling)
+
+# Output configuration  
+output_path: null                    # Will use fabric logger directory if not specified
+save_raw_data: true                 # Save raw numerical results as CSV
+create_summary_report: true         # Create markdown summary report
+
+# Device configuration
+device: "cuda"                      # Device to run computations on ("cuda" or "cpu")
+
+# FastFood Integration (if analyzing FastFood-merged models)
+fastfood_aware_analysis: true      # Enable FastFood-specific layer analysis
+analyze_subspace_effects_per_layer: true  # How subspace projection affects each layer
+
+# Advanced options
+_recursive_: false

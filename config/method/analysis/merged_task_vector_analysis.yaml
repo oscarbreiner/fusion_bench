@@ -23,6 +23,11 @@ merging_methods:
 proj_ratio: 0.75  # Projection ratio for subspace dimensionality (0.0 to 1.0)
 use_G: false      # Whether to use diagonal scaling matrix G in Fastfood transform
 
+# FastFood method identification parameters (for unique output files)
+merge_func: "signmax"     # Merge function used in FastFood merging
+subspace_scope: "global"  # Subspace scope used in FastFood merging
+merge_where: "subspace"   # Where merging happens in FastFood merging
+
 # Analysis parameters
 trainable_only: true              # Whether to only analyze trainable parameters
 save_individual_results: true     # Whether to save detailed per-task results

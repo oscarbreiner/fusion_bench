@@ -44,6 +44,7 @@ _import_structure = {
     "enhanced_emr_merging": ["EMRMergingAlgorithmWithTaskEval", "TaskSpecificEvaluationWrapper"],
     "ties_merging": ["TiesMergingAlgorithm"],
     "fastfood_merging": ["FastfoodSubspaceMergeAlgorithm"],
+    "fastfood_wrapper": ["FastfoodWrapperAlgorithm"],
     "dare": ["DareSimpleAverage", "DareTaskArithmetic", "DareTiesMerging"],
     "fisher_merging": [
         "FisherMergingAlgorithm",
@@ -252,6 +253,7 @@ if TYPE_CHECKING:
     from .task_singular_vector import TaskSingularVectorMerging
     from .ties_merging import TiesMergingAlgorithm
     from .fastfood_merging import FastfoodSubspaceMergeAlgorithm
+    from .fastfood_wrapper import FastfoodWrapperAlgorithm
     from .we_moe import (
         CLIPWeightEnsemblingMoEAlgorithm,
         FlanT5WeightEnsemblingMoEAlgorithm,

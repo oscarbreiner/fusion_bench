@@ -1,0 +1,21 @@
+# ============================================================================
+# FastFood Wrapper - Fisher Merging Configuration  
+# Projects to subspace, applies native Fisher algorithm, lifts back
+# Uses parameter variance across tasks as proxy for Fisher information
+# ============================================================================
+
+_target_: fusion_bench.method.fastfood_wrapper.FastfoodWrapperAlgorithm
+
+# Core FastFood projection parameters
+proj_ratio: 0.75              # Compression ratio (0.0-1.0)
+use_G: false                  # Use Gaussian scaling in FastFood
+device: "cuda"                # Computation device
+subspace_scope: "layer"       # per_tensor | layer | global
+
+# Merging configuration
+merging_method: "fisher_merging"
+method_config:
+  exclude_param_names_regex: []   # Parameters to exclude from merging
+  normalize_fisher_weight: true   # Whether to normalize Fisher weights
+  minimal_fisher_weight: 1e-6     # Minimum Fisher weight value
+  num_fisher_examples: 64         # Number of examples for Fisher computation

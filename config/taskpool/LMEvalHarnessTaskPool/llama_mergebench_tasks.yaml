@@ -1,0 +1,31 @@
+# LM-Eval Harness Task Pool for LLaMA MergeBench Evaluation
+# Comprehensive task suite for evaluating merged LLaMA-3.1 models
+# Based on MergeBench evaluation protocol
+
+_target_: fusion_bench.taskpool.LMEvalHarnessTaskPool
+_recursive_: false
+
+# Core MergeBench tasks covering different domains
+tasks:
+  - "arc_easy"           # Science QA (easy)
+  - "arc_challenge"      # Science QA (hard) 
+  - "hellaswag"          # Commonsense reasoning
+  - "winogrande"         # Winograd schema challenge
+  - "gsm8k"              # Math reasoning
+  - "humaneval"          # Code generation
+  - "mbpp"               # Python programming
+  - "truthfulqa_mc2"     # Truthfulness
+  - "mmlu"               # Massive multitask language understanding
+
+# Configuration
+apply_chat_template: true  # Important for instruction-tuned models
+batch_size: 4
+verbosity: "INFO"
+log_samples: false
+output_path: null  # Will be set by the evaluation script
+
+# Metadata for tracking
+metadata:
+  description: "MergeBench evaluation suite for LLaMA-3.1 model merging"
+  tasks_count: 9
+  domains: ["reasoning", "math", "code", "knowledge", "truthfulness"]

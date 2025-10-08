@@ -220,6 +220,10 @@ class MergedTaskVectorAnalysis(
         save_individual_results: bool = True,
         plot_heatmaps: bool = True,
         device: str = "cuda",
+        # New parameters for unique method identification
+        merge_func: str = "signmax",
+        subspace_scope: str = "global", 
+        merge_where: str = "subspace",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -231,6 +235,11 @@ class MergedTaskVectorAnalysis(
         self.save_individual_results = save_individual_results
         self.plot_heatmaps = plot_heatmaps
         self.device = torch.device(device)
+        
+        # Store FastFood parameters for unique identification
+        self.merge_func = merge_func
+        self.subspace_scope = subspace_scope
+        self.merge_where = merge_where
         
         # Validate merging methods
         supported_methods = {
@@ -247,6 +256,28 @@ class MergedTaskVectorAnalysis(
             return self.fabric.logger.log_dir
         else:
             return self._output_path
+
+    def _create_unique_method_name(self, method_name: str) -> str:
+        """Create unique method name with FastFood parameters to avoid overwriting."""
+        if method_name == "fastfood_merging":
+            # Create abbreviated parameter string for FastFood methods
+            parts = []
+            
+            if self.proj_ratio != 0.95:  # Only include if not default
+                parts.append(f"proj{self.proj_ratio}")
+            if self.merge_func != 'signmax':  # Only include if not default  
+                parts.append(f"{self.merge_func}")
+            if self.subspace_scope != 'global':  # Only include if not default
+                parts.append(f"{self.subspace_scope}")
+            if self.merge_where != 'subspace':  # Only include if not default
+                parts.append(f"{self.merge_where}")
+            
+            if parts:
+                return f"fastfood_{'_'.join(parts)}"
+            else:
+                return "fastfood_default"
+        else:
+            return method_name
 
     def _get_model_state_dict(self, model: nn.Module) -> StateDictType:
         """Get state dict from model, optionally filtering to trainable parameters only."""
@@ -471,7 +502,7 @@ class MergedTaskVectorAnalysis(
         individual_task_vectors: Dict[str, torch.Tensor]
     ) -> Dict[str, Dict[str, Any]]:
         """
-        Analyze a Fastfood method in original space, subspace, and lifted-back space.
+        Analyze a Fastfood method in subspace and lifted-back space only.
         
         Args:
             method_name: Name of the Fastfood merging method
@@ -479,19 +510,16 @@ class MergedTaskVectorAnalysis(
             individual_task_vectors: Dictionary of individual task vectors
             
         Returns:
-            Dictionary containing analysis results for all three spaces
+            Dictionary containing analysis results for subspace and lifted spaces
         """
         log.info(f"Starting comprehensive Fastfood analysis for {method_name}")
         
         results = {}
         
-        # Step 1: Analyze in original space
-        log.info("Step 1: Original space analysis")
+        # Step 1: Compute merged task vector for projection analysis
+        log.info("Step 1: Computing merged task vector")
         merged_task_vector_original = self._compute_merged_task_vector(
             method_name, pretrained_model, individual_task_vectors
-        )
-        results['original'] = self._analyze_method_in_space(
-            method_name, merged_task_vector_original, individual_task_vectors, "original"
         )
         
         # Step 2: Project to subspace and analyze
@@ -653,25 +681,26 @@ class MergedTaskVectorAnalysis(
                 
                 all_results[method_name] = method_results
                 
-                # Add to summary data (use original space results for summary)
-                if 'original' in method_results and 'summary' in method_results['original']:
-                    summary_entry = {
-                        'method': method_name,
-                        'space': 'original',
-                        **method_results['original']['summary']
-                    }
-                    summary_data.append(summary_entry)
-                    
-                    # For Fastfood methods, also add subspace and lifted results
-                    if method_name == 'fastfood_merging':
-                        for space in ['subspace', 'lifted']:
-                            if space in method_results and 'summary' in method_results[space]:
-                                summary_entry = {
-                                    'method': method_name,
-                                    'space': space,
-                                    **method_results[space]['summary']
-                                }
-                                summary_data.append(summary_entry)
+                # Add to summary data
+                if method_name == 'fastfood_merging':
+                    # For Fastfood methods, add subspace and lifted results
+                    for space in ['subspace', 'lifted']:
+                        if space in method_results and 'summary' in method_results[space]:
+                            summary_entry = {
+                                'method': method_name,
+                                'space': space,
+                                **method_results[space]['summary']
+                            }
+                            summary_data.append(summary_entry)
+                else:
+                    # For standard methods, use original space results
+                    if 'original' in method_results and 'summary' in method_results['original']:
+                        summary_entry = {
+                            'method': method_name,
+                            'space': 'original',
+                            **method_results['original']['summary']
+                        }
+                        summary_data.append(summary_entry)
                 
             except Exception as e:
                 log.error(f"Failed to analyze method {method_name}: {e}")
@@ -728,13 +757,14 @@ class MergedTaskVectorAnalysis(
                         'cosine_similarity': cosine_similarities
                     })
                     
-                    # Save to CSV
+                    # Save to CSV with unique method name
+                    unique_method_name = self._create_unique_method_name(method_name)
                     csv_path = os.path.join(
                         self.output_path, 
-                        f'merged_task_vector_analysis_{space_name}_{method_name}.csv'
+                        f'merged_task_vector_analysis_{space_name}_{unique_method_name}.csv'
                     )
                     metrics_df.to_csv(csv_path, index=False)
-                    log.info(f"Saved {space_name} space results for {method_name} to {csv_path}")
+                    log.info(f"Saved {space_name} space results for {unique_method_name} to {csv_path}")
         
         # Save human-readable report
         report_path = os.path.join(self.output_path, 'merged_task_vector_analysis_report.txt')
@@ -844,11 +874,12 @@ class MergedTaskVectorAnalysis(
             # Adjust layout and save
             plt.tight_layout()
             
-            plot_path = os.path.join(self.output_path, f'merged_task_vector_analysis_plots_{method_name}.pdf')
+            unique_method_name = self._create_unique_method_name(method_name)
+            plot_path = os.path.join(self.output_path, f'merged_task_vector_analysis_plots_{unique_method_name}.pdf')
             plt.savefig(plot_path, bbox_inches='tight', dpi=300)
             plt.close()
             
-            log.info(f"Saved analysis plots for {method_name} to {plot_path}")
+            log.info(f"Saved analysis plots for {unique_method_name} to {plot_path}")
 
 
 # Configuration mapping for Hydra  

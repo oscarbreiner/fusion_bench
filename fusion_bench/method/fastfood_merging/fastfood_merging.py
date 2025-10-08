@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Tuple
 import torch
 from torch import nn, Tensor
 
-from fusion_bench import LazyStateDict
+from fusion_bench.utils import LazyStateDict
 from fusion_bench.compat.modelpool import to_modelpool
 from fusion_bench.method import BaseAlgorithm
 from fusion_bench.mixins import SimpleProfilerMixin, auto_register_config
@@ -107,6 +107,128 @@ def _fastfood_ops(
         return y_full[..., :D].contiguous()
 
     return fwd, lift
+
+
+# --------------- TIES Aggregation Functions ----------------
+@torch.no_grad()
+def _resolve_zero_signs(sign_to_mult: Tensor, method: str = "majority") -> Tensor:
+    """
+    Resolve zero signs in a tensor by majority or minority rule.
+    
+    Args:
+        sign_to_mult: The tensor with signs to resolve.
+        method: The method to use for resolving zero signs ("majority" or "minority").
+    
+    Returns:
+        Tensor with resolved signs.
+    """
+    majority_sign = torch.sign(sign_to_mult.sum())
+    
+    if method == "majority":
+        sign_to_mult[sign_to_mult == 0] = majority_sign
+    elif method == "minority":
+        sign_to_mult[sign_to_mult == 0] = -1 * majority_sign
+    return sign_to_mult
+
+
+@torch.no_grad()
+def _resolve_sign(v: Tensor) -> Tensor:
+    """
+    Resolve the sign of a tensor by majority rule.
+    
+    Args:
+        v: The input tensor [K, ...] where K is number of tasks.
+    
+    Returns:
+        Tensor with resolved signs for each parameter position.
+    """
+    sign_to_mult = torch.sign(v.sum(dim=0))
+    sign_to_mult = _resolve_zero_signs(sign_to_mult, "majority")
+    return sign_to_mult
+
+
+@torch.no_grad()
+def _ties_disjoint_merge(v: Tensor, merge_func: str, sign_to_mult: Tensor) -> Tensor:
+    """
+    Perform TIES disjoint merging of a tensor using a specified merge function.
+    
+    Args:
+        v: The input tensor [K, ...] where K is number of tasks.
+        merge_func: The merge function to use ("mean", "sum", or "max").
+        sign_to_mult: The tensor with elected signs to use for merging.
+    
+    Returns:
+        Merged tensor.
+    """
+    merge_func = merge_func.split("-")[-1]
+    
+    # Select entries that agree with the elected sign
+    if sign_to_mult is not None:
+        rows_to_keep = torch.where(sign_to_mult.unsqueeze(0) > 0, v > 0, v < 0)
+        selected_entries = v * rows_to_keep
+    else:
+        # Fallback: select all non-zero entries
+        rows_to_keep = v != 0
+        selected_entries = v * rows_to_keep
+    
+    if merge_func == "mean":
+        non_zero_counts = (selected_entries != 0).sum(dim=0).float()
+        disjoint_aggs = torch.sum(selected_entries, dim=0) / torch.clamp(
+            non_zero_counts, min=1
+        )
+    elif merge_func == "sum":
+        disjoint_aggs = torch.sum(selected_entries, dim=0)
+    elif merge_func == "max":
+        disjoint_aggs = selected_entries.abs().max(dim=0)[0]
+        disjoint_aggs *= sign_to_mult
+    else:
+        raise ValueError(f"TIES merge method {merge_func} is not defined.")
+    
+    return disjoint_aggs
+
+
+@torch.no_grad()
+def _ties_merge_subspace(
+    U: Tensor,
+    ties_merge_func: str = "sum",
+    weights: List[float] | None = None
+) -> Tensor:
+    """
+    TIES merging in subspace (no trimming, only elect + disjoint merge).
+    
+    Args:
+        U: [K, ..., M] stacked task vectors in subspace
+        ties_merge_func: "sum" | "mean" | "max" for disjoint aggregation
+        weights: Task importance weights (applied as scaling before TIES)
+    
+    Returns:
+        Merged vector in subspace
+    """
+    K = U.shape[0]
+    if K == 0:
+        raise ValueError("No task vectors to merge")
+    if K == 1:
+        w = weights[0] if weights else 1.0
+        return w * U[0]
+    
+    # Flatten for easier processing
+    orig_shape = U.shape[1:]
+    U_flat = U.view(K, -1)  # [K, numel]
+    
+    # Apply task weights if provided (before TIES processing)
+    if weights is not None:
+        w_tensor = torch.tensor(weights, dtype=U_flat.dtype, device=U_flat.device).view(K, 1)
+        U_flat = w_tensor * U_flat
+    
+    # TIES Phase 1: Elect (Skip Trim - no parameter pruning)
+    print("RESOLVING SIGN (TIES)")
+    final_signs = _resolve_sign(U_flat)
+    
+    # TIES Phase 2: Disjoint Merge
+    print(f"DISJOINT AGGREGATION (TIES): {ties_merge_func}")
+    merged_tv = _ties_disjoint_merge(U_flat, ties_merge_func, final_signs)
+    
+    return merged_tv.view(orig_shape)
 
 
 # --------------- Zero-aware aggregation ----------------
@@ -240,7 +362,7 @@ def _zero_aware_aggregate(
 ) -> Tensor:
     """
     U: [K, ..., M] stacked donors in the chosen mixing space (subspace or postlift).
-    merge_func ∈ {'sum','mean','max','signmax','ema'}:
+    merge_func ∈ {'sum','mean','max','signmax','ema','ties_sum','ties_mean','ties_max'}:
       - 'sum'     : elementwise sum (weights optional)
       - 'mean'    : elementwise mean over *nonzero* contributors only (disentangled).
                     If weights given: (Σ w_k u_k 1[u_k!=0]) / (Σ w_k 1[u_k!=0])
@@ -252,11 +374,14 @@ def _zero_aware_aggregate(
                     Processes tasks sequentially with order-dependent results.
                     Task ordering: "given" (modelpool order), "random" (shuffle), 
                     "cosine_similarity" (similar tasks first), "custom" (user-specified order)
+      - 'ties_sum'  : TIES merging with sum aggregation (elect sign + disjoint merge)
+      - 'ties_mean' : TIES merging with mean aggregation (elect sign + disjoint merge)
+      - 'ties_max'  : TIES merging with max aggregation (elect sign + disjoint merge)
     """
     K = U.shape[0]
     mf = merge_func.lower()
-    if mf not in {"sum", "mean", "max", "signmax", "ema"}:
-        raise ValueError(f"merge_func={merge_func} not in {{'sum','mean','max','signmax','ema'}}")
+    if mf not in {"sum", "mean", "max", "signmax", "ema", "ties_sum", "ties_mean", "ties_max"}:
+        raise ValueError(f"merge_func={merge_func} not in {{'sum','mean','max','signmax','ema','ties_sum','ties_mean','ties_max'}}")
 
     if mf == "ema":
         return _ema_merge_subspace(
@@ -267,6 +392,15 @@ def _zero_aware_aggregate(
             ema_w_s=kwargs.get("ema_w_s", 0.4),
             weights=weights,
             custom_order=kwargs.get("ema_custom_order", None)
+        )
+
+    # Handle TIES merging variants
+    if mf.startswith("ties_"):
+        ties_func = mf.split("_", 1)[1]  # Extract "sum", "mean", or "max"
+        return _ties_merge_subspace(
+            U,
+            ties_merge_func=ties_func,
+            weights=weights
         )
 
     if mf == "sum":
@@ -345,7 +479,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
     Controls:
       subspace_scope: "per_tensor" | "layer" | "global"
       merge_where:    "subspace" | "postlift"
-      merge_func:     "sum" | "mean" | "max" | "signmax" | "ema"  (zero-aware & disentangled)
+      merge_func:     "sum" | "mean" | "max" | "signmax" | "ema" | "ties_sum" | "ties_mean" | "ties_max"  (zero-aware & disentangled)
       proj_ratio:     float (0..1)
       use_G:          bool
       block_rows:     int
@@ -379,6 +513,10 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         ema_w_c: float = 0.6,            # cosine alignment weight
         ema_w_s: float = 0.4,            # scale ratio weight
         ema_custom_order: List[str] | None = None,  # task names in desired order (when ema_task_order="custom")
+        # Analysis integration parameters
+        run_analysis: bool = False,      # Whether to run integrated analysis after merging
+        analysis_methods: List[str] = None,  # List of analysis methods to run
+        analysis_output_path: str = None,    # Path for analysis outputs
         # Kept in signature for compatibility (not used since align logic removed)
         ties_trim_pct: float = 0.0,
         tadrop_tau: float = 0.0,
@@ -403,6 +541,11 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self.ema_w_c = float(ema_w_c)
         self.ema_w_s = float(ema_w_s)
         self.ema_custom_order = list(ema_custom_order) if ema_custom_order is not None else None
+        
+        # Analysis parameters
+        self.run_analysis = run_analysis
+        self.analysis_methods = analysis_methods or []
+        self.analysis_output_path = analysis_output_path
 
     # ------------------- main -------------------
     @torch.no_grad()
@@ -574,7 +717,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         Xmerge = _zero_aware_aggregate(
                             U_stack,
                             merge_func=self.merge_func,
-                            weights=w if self.merge_func in {"sum", "mean", "ema"} else None,
+                            weights=w if self.merge_func in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"} else None,
                             ema_task_order=self.ema_task_order,
                             ema_gamma=self.ema_gamma,
                             ema_w_c=self.ema_w_c,
@@ -587,7 +730,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         Ymerge = _zero_aware_aggregate(
                             U_stack,
                             merge_func=self.merge_func,
-                            weights=w if self.merge_func in {"sum", "mean", "ema"} else None,
+                            weights=w if self.merge_func in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"} else None,
                             ema_task_order=self.ema_task_order,
                             ema_gamma=self.ema_gamma,
                             ema_w_c=self.ema_w_c,
@@ -692,4 +835,144 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         if changed_params == 0:
             print("⚠️ Note: processed tensors but no numeric changes detected (donor deltas may be zero).")
 
+        # ---------- Run Analysis (if enabled) ----------
+        if self.run_analysis and self.analysis_methods:
+            print("\n=== Running Integrated Analysis ===")
+            self._run_integrated_analysis(modelpool, model)
+
         return model
+
+    def _run_integrated_analysis(self, modelpool: BaseModelPool, merged_model: nn.Module):
+        """
+        Run integrated analysis methods after merging with reused Fastfood projections.
+        
+        This method runs analysis using the same Fastfood operators that were used
+        for merging, ensuring consistency and avoiding redundant computation.
+        
+        Args:
+            modelpool: The original model pool
+            merged_model: The merged model result
+        """
+        print(f"[Analysis] Running {len(self.analysis_methods)} analysis methods")
+        
+        # Create unique method identifier for analysis outputs
+        method_id = self._create_method_identifier()
+        
+        for analysis_method in self.analysis_methods:
+            try:
+                print(f"[Analysis] Running {analysis_method}")
+                
+                if analysis_method == "merged_task_vector":
+                    self._run_merged_task_vector_analysis(modelpool, method_id)
+                elif analysis_method == "task_vector_similarity":
+                    self._run_task_vector_similarity_analysis(modelpool, method_id)
+                elif analysis_method == "task_vector_layer":
+                    self._run_task_vector_layer_analysis(modelpool, method_id)
+                else:
+                    print(f"[Analysis] Warning: Unknown analysis method '{analysis_method}'")
+                    
+            except Exception as e:
+                print(f"[Analysis] Error in {analysis_method}: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    def _create_method_identifier(self) -> str:
+        """Create unique method identifier for analysis outputs."""
+        parts = []
+        
+        if self.proj_ratio != 0.95:
+            parts.append(f"proj{self.proj_ratio}")
+        if self.merge_func != 'signmax':
+            parts.append(f"{self.merge_func}")
+        if self.subspace_scope != 'global':
+            parts.append(f"{self.subspace_scope}")
+        if self.merge_where != 'subspace':
+            parts.append(f"{self.merge_where}")
+        
+        # Add EMA-specific parameters if using EMA
+        if self.merge_func == 'ema':
+            parts.append(f"g{self.ema_gamma}")
+            parts.append(f"wc{self.ema_w_c}")
+            parts.append(f"ws{self.ema_w_s}")
+            if self.ema_task_order != 'given':
+                order_abbrev = {
+                    'random': 'rand',
+                    'cosine_similarity': 'cos',
+                    'custom': 'cust'
+                }
+                parts.append(f"{order_abbrev.get(self.ema_task_order, self.ema_task_order)}")
+        
+        # Add TIES identifier for TIES variants
+        if self.merge_func.startswith('ties_'):
+            parts.append("ties")
+        
+        if parts:
+            return f"fastfood_{'_'.join(parts)}"
+        else:
+            return "fastfood_default"
+    
+    def _run_merged_task_vector_analysis(self, modelpool: BaseModelPool, method_id: str):
+        """Run merged task vector analysis with reused Fastfood projections."""
+        try:
+            from fusion_bench.method.analysis.merged_task_vector_analysis import MergedTaskVectorAnalysis
+            
+            # Create analyzer with matching parameters
+            analyzer = MergedTaskVectorAnalysis(
+                merging_methods=["fastfood_merging"],
+                proj_ratio=self.proj_ratio,
+                use_G=self.use_G,
+                merge_func=self.merge_func,
+                subspace_scope=self.subspace_scope,
+                merge_where=self.merge_where,
+                trainable_only=True,
+                output_path=self.analysis_output_path,
+                device=str(self.device)
+            )
+            
+            print(f"[Analysis] Running merged task vector analysis for {method_id}")
+            analyzer.run(modelpool)
+            
+        except ImportError as e:
+            print(f"[Analysis] Could not import MergedTaskVectorAnalysis: {e}")
+    
+    def _run_task_vector_similarity_analysis(self, modelpool: BaseModelPool, method_id: str):
+        """Run task vector similarity analysis in both original and subspace."""
+        try:
+            from fusion_bench.method.analysis.task_vector_cos_similarity import TaskVectorCosSimilarity
+            
+            # Create analyzer with matching parameters
+            analyzer = TaskVectorCosSimilarity(
+                plot_heatmap=True,
+                trainable_only=True,
+                method_name=method_id,
+                proj_ratio=self.proj_ratio,
+                use_G=self.use_G,
+                analyze_subspace=True,
+                device=str(self.device),
+                output_path=self.analysis_output_path
+            )
+            
+            print(f"[Analysis] Running task vector similarity analysis for {method_id}")
+            analyzer.run(modelpool)
+            
+        except ImportError as e:
+            print(f"[Analysis] Could not import TaskVectorCosSimilarity: {e}")
+    
+    def _run_task_vector_layer_analysis(self, modelpool: BaseModelPool, method_id: str):
+        """Run layer-wise task vector analysis."""
+        try:
+            from fusion_bench.method.analysis.task_vector_layer_analysis import TaskVectorLayerAnalysis
+            
+            # Create analyzer
+            analyzer = TaskVectorLayerAnalysis(
+                trainable_only=True,
+                method_name=method_id,
+                device=str(self.device),
+                output_path=self.analysis_output_path
+            )
+            
+            print(f"[Analysis] Running layer-wise task vector analysis for {method_id}")
+            analyzer.run(modelpool)
+            
+        except ImportError as e:
+            print(f"[Analysis] Could not import TaskVectorLayerAnalysis: {e}")

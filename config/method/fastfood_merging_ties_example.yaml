@@ -1,6 +1,8 @@
+# Example FastFood configuration with TIES merging variants
+# This demonstrates the new TIES aggregation options in FastFood merging
+
 # ============================================================================
-# FastFood Subspace Merging Configuration
-# Supports multiple merging functions including EMA with adaptive β_t
+# FastFood Subspace Merging with TIES Configuration
 # ============================================================================
 
 _target_: fusion_bench.method.fastfood_merging.FastfoodSubspaceMergeAlgorithm
@@ -20,41 +22,25 @@ subspace_scope: "global"     # per_tensor | layer | global
 merge_where: "subspace"       # subspace | postlift
 
 # ============================================================================
-# Merging Strategy
+# TIES Merging Strategy (NEW!)
 # ============================================================================
-merge_func: "signmax"         # sum | mean | max | signmax | ema | ties_sum | ties_mean | ties_max
+merge_func: "ties_sum"        # Standard options: sum | mean | max | signmax | ema
+                              # NEW TIES options: ties_sum | ties_mean | ties_max
+                              
+# TIES variants explanation:
+# - ties_sum:  Elect majority sign per parameter, then sum agreeing task vectors
+# - ties_mean: Elect majority sign per parameter, then mean of agreeing task vectors  
+# - ties_max:  Elect majority sign per parameter, then max magnitude with correct sign
+#
+# Note: TIES implementation in FastFood skips the Trim phase (no parameter pruning)
+# and focuses on Elect phase (sign resolution) + Disjoint Merge phase (selective aggregation)
+
 align_mode: "none"            # none | ties | tadrop
-
-# ============================================================================
-# EMA Parameters (Active when merge_func="ema")
-# ============================================================================
-ema_task_order: "custom"       # given | random | cosine_similarity | custom
-ema_gamma: 2.0 #1.2                # Sigmoid scaling factor (0.5-2.0)
-ema_w_c: 0.8 #0.6                  # Cosine alignment weight (0.0-1.0)
-ema_w_s: 0.2 #0.4                  # Scale ratio weight (0.0-1.0, w_c + w_s = 1.0)
-ema_custom_order: 
-  - "SUN397"
-  - "Stanford-Cars" 
-  - "DTD"
-  - "GTSRB"
-  - "SVHN"
-  - "MNIST"
-  - "RESISC45"
-  - "EuroSAT"
-
-# ============================================================================
-# TIES Merging Options (when merge_func starts with "ties_")
-# Note: TIES implementation skips the Trim phase (no parameter pruning)
-# and focuses on Elect phase (sign resolution) + Disjoint Merge phase
-# ============================================================================
-# ties_sum:  Elect majority sign per parameter, then sum agreeing task vectors
-# ties_mean: Elect majority sign per parameter, then mean of agreeing task vectors  
-# ties_max:  Elect majority sign per parameter, then max magnitude with correct sign
 
 # ============================================================================
 # Advanced Alignment Options
 # ============================================================================
-ties_trim_pct: 0.0            # TIES pruning percentage (0.0-1.0)
+ties_trim_pct: 0.0            # TIES pruning percentage (0.0-1.0) - NOT USED in FastFood TIES
 tadrop_tau: 0.0               # Task Arithmetic dropout threshold
 
 # ============================================================================
@@ -70,6 +56,4 @@ scale: 1.0                    # Global scaling factor
 # ============================================================================
 run_analysis: false          # Whether to run analysis after merging (disabled for SLURM workflow control)
 analysis_methods: [merged_task_vector, task_vector_similarity, task_vector_layer]
-          # List of analysis methods to run
-                             # Options: merged_task_vector, task_vector_similarity, task_vector_layer
 analysis_output_path: null    # Path for analysis outputs (uses fabric logger if null)

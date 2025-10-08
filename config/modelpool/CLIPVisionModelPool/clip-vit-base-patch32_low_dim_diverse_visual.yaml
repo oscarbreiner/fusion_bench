@@ -1,0 +1,26 @@
+# Config for DTD, EuroSAT, RESISC45, Stanford-Cars, SUN397 image classification tasks
+defaults:
+  - /dataset/image_classification/train@train_datasets:
+      - dtd
+      - eurosat
+      - resisc45
+      - stanford-cars
+      - sun397
+  - /dataset/image_classification/test@test_datasets:
+      - dtd
+      - eurosat
+      - resisc45
+      - stanford-cars
+      - sun397
+  - _self_
+_target_: fusion_bench.modelpool.CLIPVisionModelPool
+_recursive_: False
+processor: openai/clip-vit-base-patch32
+models:
+  _pretrained_: openai/clip-vit-base-patch32
+  dtd: tanganke/clip-vit-base-patch32_dtd
+  eurosat: tanganke/clip-vit-base-patch32_eurosat
+  resisc45: tanganke/clip-vit-base-patch32_resisc45
+  stanford-cars: tanganke/clip-vit-base-patch32_stanford-cars
+  sun397: tanganke/clip-vit-base-patch32_sun397
+platform: hf

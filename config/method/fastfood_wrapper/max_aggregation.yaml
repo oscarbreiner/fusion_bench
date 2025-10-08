@@ -1,0 +1,16 @@
+# ============================================================================
+# FastFood Wrapper - Max Aggregation Configuration
+# Projects to subspace, applies max aggregation of task vectors, lifts back  
+# ============================================================================
+
+_target_: fusion_bench.method.fastfood_wrapper.FastfoodWrapperAlgorithm
+
+# Core FastFood projection parameters
+proj_ratio: 0.75              # Compression ratio (0.0-1.0)
+use_G: false                  # Use Gaussian scaling in FastFood
+device: "cuda"                # Computation device
+subspace_scope: "layer"       # per_tensor | layer | global
+
+# Merging configuration
+merging_method: "max_aggregation"
+method_config: {}             # No additional config needed

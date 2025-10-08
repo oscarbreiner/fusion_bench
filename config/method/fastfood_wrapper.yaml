@@ -1,0 +1,83 @@
+# ============================================================================
+# FastFood Wrapper Configuration
+# Projects models to lower-dimensional subspace, applies merging, lifts back
+# ============================================================================
+
+_target_: fusion_bench.method.fastfood_wrapper.FastfoodWrapperAlgorithm
+
+# ============================================================================
+# Core FastFood Projection Parameters
+# ============================================================================
+proj_ratio: 0.75              # Subspace compression ratio (0.0-1.0)
+use_G: false                  # Use Gaussian scaling in FastFood transform
+device: "cuda"                # Computation device
+
+# ============================================================================
+# Subspace Configuration
+# ============================================================================
+subspace_scope: "layer"       # per_tensor | layer | global
+                              # - per_tensor: Each parameter gets its own projection
+                              # - layer: Parameters grouped by layer
+                              # - global: All parameters use single projection
+
+# ============================================================================
+# Merging Method Configuration
+# ============================================================================
+merging_method: "simple_average"  # Which method to use in subspace
+                                  # Options: simple_average | task_arithmetic | 
+                                  #         ties_merging | fisher_merging |
+                                  #         task_singular_vector | max_aggregation
+
+# Method-specific configuration (passed to wrapped algorithm)
+method_config:
+  # For task_arithmetic:
+  scaling_factor: 0.3
+  
+  # For ties_merging:
+  # scaling_factor: 0.3
+  # threshold: 20
+  # merge_func: sum
+  
+  # For fisher_merging:
+  # exclude_param_names_regex: []
+  
+  # For task_singular_vector:
+  # alpha: 1
+  # return_single_task_models: false
+
+# ============================================================================
+# Example configurations for different merging methods
+# ============================================================================
+
+# Simple Average (default):
+# merging_method: "simple_average"
+# method_config: {}
+
+# Task Arithmetic:
+# merging_method: "task_arithmetic"  
+# method_config:
+#   scaling_factor: 0.3
+
+# TIES Merging:
+# merging_method: "ties_merging"
+# method_config:
+#   scaling_factor: 0.3
+#   threshold: 20
+#   merge_func: sum
+#   remove_keys: []
+
+# Fisher Merging:
+# merging_method: "fisher_merging"
+# method_config:
+#   exclude_param_names_regex: []
+
+# Task Singular Vector Merging (TSVM):
+# merging_method: "task_singular_vector"
+# method_config:
+#   alpha: 1
+#   exclude_keys: null
+#   return_single_task_models: false
+
+# Max Aggregation:
+# merging_method: "max_aggregation"
+# method_config: {}

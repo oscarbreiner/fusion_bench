@@ -1,3 +1,5 @@
 from .fastfood_merging import FastfoodSubspaceMergeAlgorithm
+from .ff_whitening_merging import FastfoodWhiteningMergeAlgorithm
+from .multi_scale_fastfood_merging import MultiScaleFastfoodMergeAlgorithm
 
-__all__ = ["FastfoodSubspaceMergeAlgorithm"]
+__all__ = ["FastfoodSubspaceMergeAlgorithm", "FastfoodWhiteningMergeAlgorithm", "MultiScaleFastfoodMergeAlgorithm"]

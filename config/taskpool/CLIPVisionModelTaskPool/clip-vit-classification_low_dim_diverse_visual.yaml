@@ -1,0 +1,8 @@
+defaults:
+  - CLIPVisionModelTaskPool@: _template
+  - /dataset/image_classification/test@test_datasets:
+      - dtd
+      - eurosat
+      - resisc45
+      - stanford-cars
+      - sun397

@@ -1,0 +1,42 @@
+# ============================================================================
+# FastFood Whitening Subspace Merging Configuration
+# Combines FastFood efficiency with TSVM whitening for interference reduction
+# ============================================================================
+
+_target_: fusion_bench.method.fastfood_merging.ff_whitening_merging.FastfoodWhiteningMergeAlgorithm
+
+# ============================================================================
+# Core FastFood Parameters
+# ============================================================================
+proj_ratio: 0.75              # Subspace compression ratio (0.0-1.0) - used if adaptive_proj_dim=false
+use_G: false                  # Use Gaussian scaling in FastFood transform
+device: "cuda"                # Computation device
+block_rows: 8192              # Memory management for large tensors
+
+# ============================================================================
+# Subspace Configuration
+# ============================================================================
+subspace_scope: "global"      # per_tensor | layer | global
+
+# ============================================================================
+# Whitening & Aggregation Strategy  
+# ============================================================================
+aggregation_method: "mean"    # mean | sum | median - How to aggregate whitened vectors
+whitening_eps: 1e-8           # Numerical stability constant for whitening transform
+adaptive_proj_dim: true       # Use D/T heuristic from TSVM (recommended: true)
+enable_whitening: true        # Enable/disable whitening transformation (false = regular FastFood)
+
+# ============================================================================
+# Task Weighting & Post-processing
+# ============================================================================
+weights: null                 # Task importance weights [w1, w2, ..., wN] (null = equal weights)
+scale: 1.0                    # Global scaling factor applied to merged deltas
+
+# ============================================================================
+# Integrated Analysis Options
+# ============================================================================
+run_analysis: false          # Whether to run analysis after merging (disabled for SLURM workflow control)
+analysis_methods: [merged_task_vector, task_vector_similarity, task_vector_layer]
+          # List of analysis methods to run
+                             # Options: merged_task_vector, task_vector_similarity, task_vector_layer
+analysis_output_path: null    # Path for analysis outputs (uses fabric logger if null)

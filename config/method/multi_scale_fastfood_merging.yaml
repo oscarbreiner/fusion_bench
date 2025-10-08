@@ -1,0 +1,57 @@
+# ============================================================================
+# Multi-Scale FastFood Subspace Merging Configuration
+# Projects task vectors into multiple subspaces and aggregates at two levels
+# ============================================================================
+
+_target_: fusion_bench.method.fastfood_merging.MultiScaleFastfoodMergeAlgorithm
+
+# ============================================================================
+# Multi-Scale Configuration
+# ============================================================================
+proj_dims: [0.25, 0.50, 0.75]        # Projection dimensions (ratios < 1.0 or absolute values >= 1.0)
+subspace_func: "signmax"              # Aggregation within each subspace: sum | mean | max | signmax | ema  
+postlift_func: "weighted_mean"        # Aggregation across scales: sum | mean | max | signmax | ema | weighted_sum | weighted_mean
+scale_weights: null                   # Optional weights for different scales [w1, w2, w3, ...]
+                                      # If null and postlift_func is weighted_*, uses projection dimension as weight
+
+# ============================================================================
+# Core FastFood Parameters  
+# ============================================================================
+use_G: false                          # Use Gaussian scaling in FastFood transform
+device: "cuda"                        # Computation device
+block_rows: 8192                      # Memory management for large tensors
+
+# ============================================================================
+# Subspace Configuration
+# ============================================================================
+subspace_scope: "global"              # per_tensor | layer | global
+
+# ============================================================================
+# Task Weights and Scaling
+# ============================================================================
+weights: null                         # Task importance weights [w1, w2, ..., wN] for donor models
+scale: 1.0                           # Global scaling factor applied to final result
+
+# ============================================================================
+# EMA Parameters (Active when subspace_func="ema" or postlift_func="ema")
+# ============================================================================
+ema_task_order: "given"               # given | random | cosine_similarity | custom
+ema_gamma: 1.2                        # Sigmoid scaling factor (0.5-2.0)
+ema_w_c: 0.6                          # Cosine alignment weight (0.0-1.0)
+ema_w_s: 0.4                          # Scale ratio weight (0.0-1.0, w_c + w_s = 1.0)
+ema_custom_order: null                # Task names in desired order (when ema_task_order="custom")
+
+# ============================================================================
+# Integrated Analysis Options
+# ============================================================================
+run_analysis: false                   # Whether to run analysis after merging
+analysis_methods: []                  # List of analysis methods to run
+                                     # Options: merged_task_vector, task_vector_similarity, task_vector_layer
+analysis_output_path: null           # Path for analysis outputs (uses fabric logger if null)
+
+# ============================================================================
+# Compatibility Parameters
+# ============================================================================
+ties_trim_pct: 0.0                   # Kept for compatibility (unused)
+tadrop_tau: 0.0                      # Kept for compatibility (unused)
+use_pareto: false                    # Kept for compatibility (unused)

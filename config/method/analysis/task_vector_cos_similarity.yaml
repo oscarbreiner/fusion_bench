@@ -1,5 +1,39 @@
-_target_: fusion_bench.method.TaskVectorCosSimilarity
+_target_: fusion_bench.method.analysis.TaskVectorCosSimilarity
 plot_heatmap: true
 trainable_only: true
 max_points_per_model: null
 output_path: null
+method_name: "default"
+
+# Subspace analysis parameters
+proj_ratio: 0.75      # Projection ratio for Fastfood subspace (0.0 to 1.0)
+use_G: false          # Whether to use diagonal scaling matrix G in Fastfood transform
+analyze_subspace: true # Whether to analyze in Fastfood subspace in addition to original space
+device: "cuda"        # Device to run computations on
+
+# FastFood-specific parameters for unique method name generation
+# These parameters help generate unique output filenames to prevent overwrites
+# during projection sweeps. They are automatically set by comprehensive_model_analysis.py
+merge_func: null       # FastFood merge function (e.g., "signmax", "ema")
+subspace_scope: null   # FastFood subspace scope (e.g., "global", "layer")  
+merge_where: null      # FastFood merge location (e.g., "subspace", "original")
+
+# Configurable Metrics Selection
+# Enable/disable specific metrics to improve performance and focus analysis
+# Basic metrics (always computed for backward compatibility)
+compute_cosine_similarity: true    # Angular similarity between task vectors
+compute_l2_distance: true         # Euclidean distance between task vectors
+compute_sign_conflicts: true      # Ratio of parameters with conflicting signs
+
+# Advanced metrics (can be disabled for performance)
+compute_fisher_divergence: true   # Information geometry differences (optimization landscape)
+compute_spectral_angle: false      # Directional differences (magnitude-invariant)
+compute_magnitude_ratio: false     # Relative scaling effects (crucial for subspace analysis)
+compute_kl_divergence: false       # Parameter importance distribution differences
+compute_js_divergence: true       # Symmetric version of KL divergence
+compute_wasserstein_distance: false # Earth  mover's distance (transformation cost)
+
+# Visualization options
+create_comprehensive_plots: true   # ENABLED - Create plots for all enabled metrics including Fisher & JS divergence
+create_basic_plots: true          # 3-panel basic visualization (faster)
+plot_only_enabled_metrics: true   # If true, only plot metrics that are enabled

@@ -1,10 +1,10 @@
 # fastfood_merging.py
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
+import math
 
 import torch
 from torch import nn, Tensor
-import math
 
 from fusion_bench.utils import LazyStateDict
 from fusion_bench.compat.modelpool import to_modelpool
@@ -33,13 +33,25 @@ _layer_key = layer_key
 @auto_register_config
 class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
     """
-    Task-vector merging via Fastfood/SRHT subspaces.
+    Task-vector merging via Fastfood/SRHT subspaces with layer-wise projection sizes.
 
     Controls:
-      subspace_scope: "per_tensor" | "layer" | "global"
+      layer_proj_mode: "custom" | "inverse" | "forward" | "feature_split"
+        - custom: provide explicit layer -> proj_ratio mapping via layer_projections
+        - inverse: weight by inverse layer number (earlier layers get smaller projections)
+        - forward: weight by layer number (later layers get smaller projections)
+        - feature_split: split into feature extraction and rest
+      
+      layer_projections: dict[str, float] (for custom mode, maps layer names to proj_ratios)
+      proj_ratio: float (0..1) (base/default projection ratio)
+      
+      # For feature_split mode:
+      feature_extractor_layers: int (number of first layers belonging to feature extractor)
+      feature_proj_ratio: float (projection ratio for feature extractor layers)
+      rest_proj_ratio: float (projection ratio for remaining layers)
+      
       merge_where:    "subspace" | "postlift"
-      merge_func:     "sum" | "mean" | "max" | "signmax" | "ema" | "ties_sum" | "ties_mean" | "ties_max"  (zero-aware & disentangled)
-      proj_ratio:     float (0..1)
+      merge_func:     "sum" | "mean" | "max" | "signmax" | "ema" | "ties_sum" | "ties_mean" | "ties_max"
       use_G:          bool
       block_rows:     int
       weights:        list[float] (donor weights; normalized internally)
@@ -51,8 +63,6 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
       ema_w_c:        float (cosine alignment weight, default 0.6)
       ema_w_s:        float (scale ratio weight, default 0.4)
       ema_custom_order: list[str] (task names in desired order, when ema_task_order="custom")
-      
-      ties_trim_pct, tadrop_tau, use_pareto: kept for API compatibility (unused)
     """
 
     def __init__(
@@ -60,7 +70,12 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         proj_ratio: float = 0.10,
         use_G: bool = False,
         device: str = "cuda",
-        subspace_scope: str = "global",  # "per_tensor" | "layer" | "global"
+        layer_proj_mode: str = "inverse",  # "custom" | "inverse" | "forward" | "feature_split"
+        layer_projections: Dict[str, float] | None = None,  # for custom mode
+        # For feature_split mode:
+        feature_extractor_layers: int = 0,
+        feature_proj_ratio: float = 0.05,
+        rest_proj_ratio: float = 0.15,
         merge_where: str = "subspace",   # "subspace" | "postlift"
         merge_func: str = "sum",         # "sum" | "mean" | "max" | "signmax" | "ema"
         block_rows: int = 8192,
@@ -86,7 +101,15 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self.proj_ratio = float(proj_ratio)
         self.use_G = bool(use_G)
         self.device = torch.device(device)
-        self.subspace_scope = str(subspace_scope)
+        
+        # Layer-wise projection configuration
+        self.layer_proj_mode = str(layer_proj_mode)
+        assert self.layer_proj_mode in {"custom", "inverse", "forward", "feature_split"}
+        self.layer_projections = layer_projections or {}
+        self.feature_extractor_layers = int(feature_extractor_layers)
+        self.feature_proj_ratio = float(feature_proj_ratio)
+        self.rest_proj_ratio = float(rest_proj_ratio)
+        
         assert merge_where in {"subspace", "postlift"}
         self.merge_where = merge_where
         self.merge_func = str(merge_func).lower()
@@ -105,6 +128,83 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self.run_analysis = run_analysis
         self.analysis_methods = analysis_methods or []
         self.analysis_output_path = analysis_output_path
+
+    def _extract_layer_number(self, param_name: str) -> int:
+        """
+        Extract layer number from parameter name.
+        
+        Tries to find patterns like:
+        - model.layer.0.attention... -> 0
+        - encoder.layers.12.mlp... -> 12
+        - blocks.5.norm... -> 5
+        
+        Returns -1 if no layer number found.
+        """
+        import re
+        # Common patterns for layer numbers
+        patterns = [
+            r'\.layer\.(\d+)\.',
+            r'\.layers\.(\d+)\.',
+            r'\.blocks\.(\d+)\.',
+            r'\.encoder\.(\d+)\.',
+            r'\.decoder\.(\d+)\.',
+            r'\.h\.(\d+)\.',  # GPT-style
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, param_name)
+            if match:
+                return int(match.group(1))
+        
+        return -1
+    
+    def _get_proj_ratio_for_layer(self, param_name: str, layer_name: str, layer_num: int, total_layers: int) -> float:
+        """
+        Get projection ratio for a specific layer based on the configured mode.
+        
+        Args:
+            param_name: Full parameter name
+            layer_name: Layer key (from layer_key function)
+            layer_num: Extracted layer number (-1 if not found)
+            total_layers: Total number of layers in the model
+            
+        Returns:
+            Projection ratio for this layer
+        """
+        if self.layer_proj_mode == "custom":
+            # Use explicit mapping
+            if layer_name in self.layer_projections:
+                return float(self.layer_projections[layer_name])
+            # Fallback to base ratio
+            return self.proj_ratio
+        
+        elif self.layer_proj_mode == "inverse":
+            # Earlier layers get smaller projections: proj_ratio * (1 / (layer_num + 1))
+            if layer_num >= 0 and total_layers > 0:
+                # Normalize to [0, 1] range and invert
+                normalized_pos = (layer_num + 1) / (total_layers + 1)
+                return self.proj_ratio * (1.0 / normalized_pos)
+            return self.proj_ratio
+        
+        elif self.layer_proj_mode == "forward":
+            # Later layers get smaller projections: proj_ratio * layer_num / total_layers
+            if layer_num >= 0 and total_layers > 0:
+                normalized_pos = (layer_num + 1) / (total_layers + 1)
+                return self.proj_ratio * normalized_pos
+            return self.proj_ratio
+        
+        elif self.layer_proj_mode == "feature_split":
+            # Split into feature extraction and rest
+            if layer_num >= 0:
+                if layer_num < self.feature_extractor_layers:
+                    return self.feature_proj_ratio
+                else:
+                    return self.rest_proj_ratio
+            # If layer number not found, use feature extractor ratio as default
+            return self.feature_proj_ratio
+        
+        # Default fallback
+        return self.proj_ratio
 
     # ------------------- main -------------------
     @torch.no_grad()
@@ -171,36 +271,41 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             
             print(f"[EMA] Custom task order: {self.ema_custom_order} -> indices {ema_custom_indices}")
 
-        # ---------- Seed scoping ----------
+        # ---------- Layer analysis for projection sizing ----------
+        # Extract all layer names and numbers
+        layer_info = {}  # layer_name -> (layer_num, param_names)
+        for k in keys_float:
+            lname = _layer_key(k)
+            lnum = self._extract_layer_number(k)
+            if lname not in layer_info:
+                layer_info[lname] = (lnum, [])
+            layer_info[lname][1].append(k)
+        
+        # Determine total number of layers (max layer number found)
+        layer_numbers = [lnum for lnum, _ in layer_info.values() if lnum >= 0]
+        total_layers = max(layer_numbers) + 1 if layer_numbers else 0
+        
+        print(f"[Layer Analysis] Found {len(layer_info)} layer groups | Total layers: {total_layers}")
+        print(f"[Projection Mode] {self.layer_proj_mode}")
+        
+        # Compute projection ratios for each layer
+        layer_proj_ratios = {}
+        for lname, (lnum, params) in layer_info.items():
+            proj_r = self._get_proj_ratio_for_layer(params[0], lname, lnum, total_layers)
+            layer_proj_ratios[lname] = proj_r
+        
+        # Print summary of projection ratios
+        sorted_layers = sorted(layer_info.items(), key=lambda x: x[1][0] if x[1][0] >= 0 else 999)
+        print("\n[Projection Ratios by Layer]")
+        for lname, (lnum, params) in sorted_layers[:10]:  # Show first 10
+            proj_r = layer_proj_ratios[lname]
+            print(f"  Layer {lnum:3d} ({lname}): proj_ratio={proj_r:.4f} | {len(params)} params")
+        if len(sorted_layers) > 10:
+            print(f"  ... and {len(sorted_layers) - 10} more layers")
+
+        # ---------- Seed scoping (always per-layer now) ----------
         def proj_seed_key(param_name: str) -> str:
-            if self.subspace_scope == "global":
-                return "__GLOBAL__"
-            if self.subspace_scope == "layer":
-                return _layer_key(param_name)
-            return param_name  # per_tensor
-
-        # Determine global D (max last-dim) if needed
-        global_D = None
-        if self.subspace_scope == "global":
-            maxd = 1
-            for k in keys_float:
-                t = base_sd[k]
-                maxd = max(maxd, int(t.shape[-1]))
-            global_D = maxd
-
-        # Report subspace sizing (first few examples)
-        def _dim_for(k: str) -> Tuple[int, int]:
-            d_last = int(base_sd[k].shape[-1])
-            cur_D = global_D if (global_D is not None) else d_last
-            m = max(1, int(cur_D * self.proj_ratio))
-            return cur_D, m
-
-        ex = keys_float[:5]
-        if ex:
-            dims = [(_dim_for(k), k) for k in ex]
-            print("[Dims] scope={} | proj_ratio={:.3f} | examples:".format(self.subspace_scope, self.proj_ratio))
-            for (D, m), k in dims:
-                print(f"   - {k}: original_last_dim={int(base_sd[k].shape[-1])} | scoped_dim={D} → proj_dim={m} (compression={m/max(1,D):.3f})")
+            return _layer_key(param_name)
         
         # Show EMA parameters if using EMA
         if self.merge_func == "ema":
@@ -233,10 +338,15 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 vb = tb.view(rows, d_last).float()
                 br = min(self.block_rows, rows)
 
-                # choose scoped dim & build (or reuse) operator
+                # Get layer-specific projection ratio
                 seed_key = proj_seed_key(name)
-                cur_D = global_D if (global_D is not None) else d_last
-                proj_dim = max(1, int(cur_D * self.proj_ratio))
+                layer_num = self._extract_layer_number(name)
+                layer_proj_ratio = self._get_proj_ratio_for_layer(name, seed_key, layer_num, total_layers)
+                
+                # Use actual dimension (no global scope)
+                cur_D = d_last
+                proj_dim = max(1, int(cur_D * layer_proj_ratio))
+                
                 cache_key = (seed_key, cur_D, proj_dim)
                 if cache_key not in op_cache:
                     fwd, lift = _fastfood_ops(
@@ -253,17 +363,12 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     take = min(rows - cursor, br)
                     sl_base = vb[cursor:cursor + take, :]
 
-                    # donor deltas aligned to cur_D if global scope
+                    # donor deltas (no global alignment needed - per-layer scope)
                     Xs: List[Tensor] = []
                     for dsd in donors_cpu:
                         sl_donor = dsd[name].view(rows, d_last).float()[cursor:cursor + take, :]
                         delta = sl_donor - sl_base
-                        if global_D is not None and d_last < cur_D:
-                            buf = torch.zeros((take, cur_D), dtype=torch.float32, device="cpu")
-                            buf[:, :d_last].copy_(delta)
-                            Xs.append(buf)
-                        else:
-                            Xs.append(delta)
+                        Xs.append(delta)
 
                     # project all donors
                     Ys = [fwd(X.to(dev, non_blocking=True)) for X in Xs]
@@ -439,14 +544,21 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         """Create unique method identifier for analysis outputs."""
         parts = []
         
+        # Add layer projection mode
+        parts.append(f"layerwise_{self.layer_proj_mode}")
+        
         if self.proj_ratio != 0.95:
             parts.append(f"proj{self.proj_ratio}")
         if self.merge_func != 'signmax':
             parts.append(f"{self.merge_func}")
-        if self.subspace_scope != 'global':
-            parts.append(f"{self.subspace_scope}")
         if self.merge_where != 'subspace':
             parts.append(f"{self.merge_where}")
+        
+        # Add mode-specific parameters
+        if self.layer_proj_mode == "feature_split":
+            parts.append(f"fe{self.feature_extractor_layers}")
+            parts.append(f"feproj{self.feature_proj_ratio}")
+            parts.append(f"restproj{self.rest_proj_ratio}")
         
         # Add EMA-specific parameters if using EMA
         if self.merge_func == 'ema':
@@ -468,20 +580,20 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         if parts:
             return f"fastfood_{'_'.join(parts)}"
         else:
-            return "fastfood_default"
+            return "fastfood_layerwise_default"
     
     def _run_merged_task_vector_analysis(self, modelpool: BaseModelPool, method_id: str):
         """Run merged task vector analysis with reused Fastfood projections."""
         try:
             from fusion_bench.method.analysis.merged_task_vector_analysis import MergedTaskVectorAnalysis
             
-            # Create analyzer with matching parameters
+            # Create analyzer with matching parameters (using layer scope)
             analyzer = MergedTaskVectorAnalysis(
                 merging_methods=["fastfood_merging"],
                 proj_ratio=self.proj_ratio,
                 use_G=self.use_G,
                 merge_func=self.merge_func,
-                subspace_scope=self.subspace_scope,
+                subspace_scope="layer",  # Always layer scope for layerwise implementation
                 merge_where=self.merge_where,
                 trainable_only=True,
                 output_path=self.analysis_output_path,

@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import CLIPModel, CLIPProcessor, CLIPVisionModel
 
-from fusion_bench import cache_with_joblib
+from fusion_bench.utils import cache_with_joblib
 from fusion_bench.dataset.clip_dataset import CLIPDataset
 from fusion_bench.mixins import LightningFabricMixin
 from fusion_bench.modelpool import CLIPVisionModelPool

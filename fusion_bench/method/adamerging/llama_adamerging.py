@@ -18,7 +18,7 @@ from transformers.data.data_collator import (
     default_data_collator,
 )
 
-from fusion_bench import BaseAlgorithm
+from fusion_bench.method.base_algorithm import BaseAlgorithm
 from fusion_bench.method.simple_average import simple_average
 from fusion_bench.mixins import LightningFabricMixin, SimpleProfilerMixin
 from fusion_bench.modelpool import CausalLMPool

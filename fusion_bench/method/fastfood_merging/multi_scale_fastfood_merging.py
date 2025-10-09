@@ -1,6 +1,5 @@
 # multi_scale_fastfood_merging.py
 from __future__ import annotations
-import math
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -13,13 +12,18 @@ from fusion_bench.mixins import SimpleProfilerMixin, auto_register_config
 from fusion_bench.modelpool import BaseModelPool
 from fusion_bench.utils.type import StateDictType
 
-# Import FastFood operations from the original implementation
-from .fastfood_merging import (
-    _fastfood_ops,
-    _zero_aware_aggregate,
-    _layer_key,
-    EPS
+# Import utilities from fastfood_utils
+from .fastfood_utils import (
+    EPS,
+    create_fastfood_ops,
+    zero_aware_aggregate,
+    layer_key,
 )
+
+# Keep backward compatibility
+_fastfood_ops = create_fastfood_ops
+_zero_aware_aggregate = zero_aware_aggregate
+_layer_key = layer_key
 
 
 @torch.no_grad()

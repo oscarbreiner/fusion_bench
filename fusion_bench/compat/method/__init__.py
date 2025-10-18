@@ -39,9 +39,6 @@ class AlgorithmFactory:
         "sparse_clip_weight_ensembling_moe": "fusion_bench.method.SparseCLIPWeightEnsemblingMoEAlgorithm",
         "smile_mistral_upscaling": ".smile_upscaling.smile_mistral_upscaling.SmileMistralUpscalingAlgorithm",
         "rankone_moe": ".rankone_moe.clip_rankone_moe.CLIPRankOneMoEAlgorithm",
-        # learned fastfood methods
-        "learned_fastfood_layerwise": ".fastfood_merging.clip_learned_fastfood_layerwise.CLIPLearnedLayerWiseFastfoodMerging",
-        "clip_learnable_fastfood_merging": ".fastfood_merging.clip_learnable_fastfood_merging.CLIPLearnableFastfoodMergingAlgorithm",
     }
 
     @staticmethod

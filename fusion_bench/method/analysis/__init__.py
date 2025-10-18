@@ -3,3 +3,6 @@ from .task_vector_violin_plot import TaskVectorViolinPlot
 from .merged_model_analysis import MergedModelAnalysis
 from .merged_task_vector_analysis import MergedTaskVectorAnalysis
 from .subspace_sign_conflict_analysis import SubspaceSignConflictAnalysis
+from .layerwise_subspace_sign_conflict_analysis import LayerwiseSubspaceSignConflictAnalysis
+from .task_vector_sparsity_analysis import TaskVectorSparsityAnalysis
+from .intrinsic_dimension_analysis import IntrinsicDimensionAnalysis

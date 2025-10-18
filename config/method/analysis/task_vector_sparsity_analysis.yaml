@@ -1,0 +1,77 @@
+# Task Vector Sparsity Analysis Configuration
+#
+# Comprehensive sparsity analysis of task vectors at the layer level.
+# Analyzes sparsity patterns (percentage of near-zero parameters) across different layers
+# and tasks, providing insights into how different tasks utilize network capacity.
+#
+# Key Metrics (computed per layer per task):
+# 1. L0 Sparsity: Exact percentage of zero parameters
+# 2. Threshold Sparsity: Percentage of parameters below various thresholds
+# 3. Adaptive Sparsity: Data-driven threshold based on parameter distribution
+# 4. Component Sparsity: Separate analysis for attention vs MLP components (if enabled)
+#
+# Outputs:
+# - Sparsity heatmaps showing layer vs task patterns
+# - Distribution plots of sparsity across layers and tasks
+# - Component-wise sparsity analysis for transformer architectures
+# - Statistical summaries and correlation analysis
+# - CSV files with detailed per-layer per-task sparsity scores
+
+_target_: fusion_bench.method.analysis.task_vector_sparsity_analysis.TaskVectorSparsityAnalysis
+
+# Sparsity Thresholds
+# Multiple thresholds for near-zero parameter detection
+# Smaller values = more strict sparsity criteria
+sparsity_thresholds:
+  - 1e-6   # Very strict (near machine epsilon)
+  - 1e-5   # Strict
+  - 1e-4   # Moderate
+  - 1e-3   # Relaxed
+  - 1e-2   # Very relaxed
+
+# Component Analysis
+# Whether to analyze attention/MLP/norm components separately (for Transformers)
+analyze_components_separately: true
+
+# Adaptive Threshold Configuration
+# Method for computing data-driven sparsity thresholds
+adaptive_threshold_method: "percentile"  # "percentile", "std", "iqr"
+
+# Percentile for adaptive thresholding (only used if method is "percentile")
+# 5.0 means 5th percentile - parameters below this are considered "sparse"
+adaptive_percentile: 5.0
+
+# Core Analysis Parameters
+trainable_only: true              # Whether to only analyze trainable parameters
+device: "cuda"                    # Device to run computations on ("cuda" or "cpu")
+
+# Output Configuration
+output_path: null                 # Will use fabric logger directory if not specified
+create_visualizations: true      # Whether to create comprehensive plots
+save_raw_data: true              # Whether to save detailed CSV results
+
+# Advanced Options
+_recursive_: false
+
+# Example Alternative Configurations:
+
+# Stricter sparsity analysis:
+# sparsity_thresholds: [1e-8, 1e-7, 1e-6, 1e-5]
+# adaptive_percentile: 1.0
+
+# Component analysis disabled (faster):
+# analyze_components_separately: false
+
+# Different adaptive threshold methods:
+# adaptive_threshold_method: "std"    # Use standard deviation based threshold
+# adaptive_threshold_method: "iqr"    # Use interquartile range based threshold
+
+# CPU-only computation:
+# device: "cpu"
+
+# Custom output directory:
+# output_path: "/path/to/sparsity/analysis/results"
+
+# Minimal output (no visualizations):
+# create_visualizations: false
+# save_raw_data: false

@@ -1,13 +1,11 @@
 from .fastfood_merging import FastfoodSubspaceMergeAlgorithm
 from .multi_scale_fastfood_merging import MultiScaleFastfoodMergeAlgorithm
-from .learnable_fastfood_merging import LearnableFastfoodMergingAlgorithm
-from .clip_learnable_fastfood_merging import CLIPLearnableFastfoodMergingAlgorithm
+from .fastfood_learnable_dim import CLIPRatiosOnlyAdaFastfood
 from . import fastfood_utils
 
 __all__ = [
     "FastfoodSubspaceMergeAlgorithm",
     "MultiScaleFastfoodMergeAlgorithm",
-    "LearnableFastfoodMergingAlgorithm",
-    "CLIPLearnableFastfoodMergingAlgorithm",
+    "CLIPRatiosOnlyAdaFastfood",
     "fastfood_utils"
 ]

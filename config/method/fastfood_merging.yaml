@@ -11,7 +11,18 @@ _target_: fusion_bench.method.fastfood_merging.FastfoodSubspaceMergeAlgorithm
 proj_ratio: 0.75              # Subspace compression ratio (0.0-1.0)
 use_G: false                  # Use Gaussian scaling in FastFood transform
 device: "cuda"                # Computation device
-block_rows: 8192              # Memory management for large tensors
+block_rows: 16384             # Memory management for large tensors
+
+# ============================================================================
+# Weight Matching Preprocessing (Optional - Git Re-Basin)
+# ============================================================================
+use_weight_matching: false    # Enable weight matching to align neurons before merging
+weight_matching_max_iter: 100 # Maximum iterations for weight matching optimization
+weight_matching_seed: 0       # Random seed for reproducibility
+weight_matching_verbose: true # Print progress during weight matching
+weight_matching_input_shapes: # Custom input shapes for permutation spec generation
+  - [1, 3, 224, 224]          # Default: vision model (batch=1, RGB, 224x224)
+                                # For NLP: [[1, 512]] or similar
 
 # ============================================================================
 # Subspace Configuration
@@ -73,3 +84,10 @@ analysis_methods: [merged_task_vector, task_vector_similarity, task_vector_layer
           # List of analysis methods to run
                              # Options: merged_task_vector, task_vector_similarity, task_vector_layer
 analysis_output_path: null    # Path for analysis outputs (uses fabric logger if null)
+
+# ============================================================================
+# Task Arithmetic Reconstruction mode
+# ============================================================================
+use_task_arithmetic_reconstruction: false
+task_arithmetic_scaling: 1.0  # Standard TA scaling factor
+report_reconstruction_error: true  # Report reconstruction error after projection

@@ -1,0 +1,46 @@
+# ============================================================================
+# Learnable Fastfood Subspace Merging Configuration
+# Optimizes per-layer projection ratios via test-time adaptation (TTA)
+# ============================================================================
+
+_target_: fusion_bench.method.fastfood_merging.CLIPRatiosOnlyAdaFastfood
+
+# ============================================================================
+# Core FastFood Parameters
+# ============================================================================
+use_G: false                  # Use Gaussian scaling in FastFood transform
+subspace_scope: "layer"       # per_tensor | layer | global
+block_rows: 8192              # Memory management for large tensors
+eps_ratio: 0.05               # Minimum ratio value (prevents collapse to 0)
+soft_temperature: 10.0        # Temperature for soft gating in differentiable filter
+
+# ============================================================================
+# Optimization Parameters
+# ============================================================================
+proj_lr: 0.001                # Learning rate for projection ratios (theta)
+max_steps: 500                # Maximum TTA optimization steps
+fast_dev_run: false           # Quick test mode (1 step only)
+
+# ============================================================================
+# Loss Plot Settings
+# ============================================================================
+plot_loss: true               # Enable loss curve plotting
+loss_plot_path: "learnable_fastfood_loss.png"  # Output filename for loss plot
+
+# ============================================================================
+# Notes
+# ============================================================================
+# This method performs test-time adaptation (TTA) to learn optimal per-layer
+# projection ratios by minimizing cross-entropy loss on test data.
+# 
+# The learnable parameters are:
+#   - theta_l for each layer l (transformed via sigmoid to ratio in [eps, 1])
+#
+# Fixed components:
+#   - Donor aggregation: mean in Fastfood space
+#   - Fastfood transform parameters (B, G, Pi)
+#   - Base model and donor models (frozen)
+#
+# The method requires:
+#   - get_shuffled_test_loader_iter(task) to be implemented by the program
+#   - CLIP-style models with image features

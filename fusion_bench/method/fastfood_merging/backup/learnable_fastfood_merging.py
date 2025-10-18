@@ -26,9 +26,13 @@ Example usage:
 from __future__ import annotations
 
 import logging
+import json
+import os
 from abc import abstractmethod
 from typing import Any, Dict, List
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch import Tensor, nn
 from tqdm.autonotebook import tqdm
@@ -106,6 +110,7 @@ class LearnableFastfoodMergingAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self,
         # Learning parameters
         init_proj_ratio: float = 0.1,
+        layer_wise_init: str = "uniform",
         lr: float = 0.01,
         max_steps: int = 500,
         optimizer: str = "adam",
@@ -127,6 +132,7 @@ class LearnableFastfoodMergingAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         
         # Analysis and saving
         save_projection_ratios: str | None = None,
+        training_report_dir: str | None = None,
         
         # Compatibility parameters (kept for config compatibility)
         merge_where: str = "subspace",
@@ -136,6 +142,7 @@ class LearnableFastfoodMergingAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         
         # Learning parameters
         self.init_proj_ratio = float(init_proj_ratio)
+        self.layer_wise_init = str(layer_wise_init)
         self.lr = float(lr)
         self.max_steps = int(max_steps)
         self.optimizer = str(optimizer)
@@ -157,13 +164,21 @@ class LearnableFastfoodMergingAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         
         # Saving
         self.save_projection_ratios = save_projection_ratios
+        self.training_report_dir = training_report_dir
+        
+        # Training tracking
+        self.training_log = {
+            'losses': [],
+            'projection_ratios': [],
+            'step_times': []
+        }
         
         # Validate
         assert 0.0 < self.init_proj_ratio <= 1.0, "init_proj_ratio must be in (0, 1]"
         assert self.optimizer == "adam", f"Only 'adam' optimizer supported, got {self.optimizer}"
         assert merge_where == "subspace", "Only subspace merging is supported"
         
-        log.info(f"Initialized LearnableFastfoodMergingAlgorithm with init_proj_ratio={self.init_proj_ratio}")
+        log.info(f"Initialized LearnableFastfoodMergingAlgorithm with init_proj_ratio={self.init_proj_ratio}, layer_wise_init={self.layer_wise_init}")
     
     def construct_learnable_merged_model(
         self,
@@ -234,9 +249,14 @@ class LearnableFastfoodMergingAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 num_layers=num_layers,
                 init_value=self.init_proj_ratio,
                 dtype=torch.float32,
+                layer_wise_init=self.layer_wise_init,
             )
             
-            log.info(f"Initialized {num_layers} projection ratios at {self.init_proj_ratio}")
+            if self.layer_wise_init == "uniform":
+                log.info(f"Initialized {num_layers} projection ratios uniformly at {self.init_proj_ratio}")
+            else:
+                log.info(f"Initialized {num_layers} projection ratios with {self.layer_wise_init} strategy")
+                log.info(f"Initial ratios: min={projection_ratios.min().item():.3f}, max={projection_ratios.max().item():.3f}, mean={projection_ratios.mean().item():.3f}")
         
         # Store necessary data for merge function
         self._layer_keys = layer_keys
@@ -363,6 +383,114 @@ class LearnableFastfoodMergingAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 merged_sd[k] = self._base_sd[k]
         
         return merged_sd
+
+    def _save_training_report(self, merged_model):
+        """Save training report and visualizations."""
+        if not self.training_report_dir:
+            return
+            
+        os.makedirs(self.training_report_dir, exist_ok=True)
+        
+        # Extract final projection ratios
+        final_ratios = merged_model.get_projection_ratios_for_analysis()
+        
+        # Prepare report data
+        report_data = {
+            'algorithm_config': {
+                'init_proj_ratio': self.init_proj_ratio,
+                'lr': self.lr,
+                'max_steps': self.max_steps,
+                'optimizer': self.optimizer,
+                'layer_wise_init': self.layer_wise_init
+            },
+            'training_log': self.training_log,
+            'final_projection_ratios': {
+                layer_name: float(ratio) for layer_name, ratio in final_ratios.items()
+            },
+            'training_summary': {
+                'total_steps': len(self.training_log['losses']),
+                'final_loss': self.training_log['losses'][-1] if self.training_log['losses'] else None,
+                'initial_loss': self.training_log['losses'][0] if self.training_log['losses'] else None,
+                'avg_ratio': float(np.mean([float(ratio) for ratio in final_ratios.values()])),
+                'min_ratio': float(np.min([float(ratio) for ratio in final_ratios.values()])),
+                'max_ratio': float(np.max([float(ratio) for ratio in final_ratios.values()])),
+                'ratio_std': float(np.std([float(ratio) for ratio in final_ratios.values()]))
+            }
+        }
+        
+        # Save JSON report
+        report_file = os.path.join(self.training_report_dir, 'training_report.json')
+        with open(report_file, 'w') as f:
+            json.dump(report_data, f, indent=2)
+        
+        print(f"Training report saved to: {report_file}")
+        
+        # Generate visualizations
+        self._generate_visualizations(report_data)
+        
+    def _generate_visualizations(self, report_data):
+        """Generate training visualizations."""
+        if not self.training_report_dir:
+            return
+            
+        # Loss curve
+        if report_data['training_log']['losses']:
+            plt.figure(figsize=(10, 6))
+            plt.subplot(2, 2, 1)
+            plt.plot(report_data['training_log']['losses'])
+            plt.title('Entropy Loss During Training')
+            plt.xlabel('Step')
+            plt.ylabel('Loss')
+            plt.grid(True)
+            
+            # Projection ratio evolution
+            plt.subplot(2, 2, 2)
+            if report_data['training_log']['projection_ratios']:
+                # Plot a few example layers
+                ratios_over_time = report_data['training_log']['projection_ratios']
+                if ratios_over_time:
+                    first_snapshot = ratios_over_time[0]
+                    layer_names = list(first_snapshot.keys())[:5]  # Plot first 5 layers
+                    
+                    for layer_name in layer_names:
+                        layer_ratios = [step_ratios.get(layer_name, 0) for step_ratios in ratios_over_time]
+                        plt.plot(layer_ratios, label=layer_name[:20] + '...' if len(layer_name) > 20 else layer_name)
+                    
+                    plt.title('Projection Ratio Evolution (Sample Layers)')
+                    plt.xlabel('Step')
+                    plt.ylabel('Projection Ratio')
+                    plt.legend()
+                    plt.grid(True)
+            
+            # Final projection ratio distribution
+            plt.subplot(2, 2, 3)
+            final_ratios = list(report_data['final_projection_ratios'].values())
+            plt.hist(final_ratios, bins=20, alpha=0.7, edgecolor='black')
+            plt.title('Final Projection Ratio Distribution')
+            plt.xlabel('Projection Ratio')
+            plt.ylabel('Frequency')
+            plt.grid(True)
+            
+            # Training summary stats
+            plt.subplot(2, 2, 4)
+            summary = report_data['training_summary']
+            stats_text = f"""Training Summary:
+Steps: {summary['total_steps']}
+Final Loss: {summary['final_loss']:.4f}
+Avg Ratio: {summary['avg_ratio']:.4f}
+Min Ratio: {summary['min_ratio']:.4f}
+Max Ratio: {summary['max_ratio']:.4f}
+Ratio Std: {summary['ratio_std']:.4f}"""
+            plt.text(0.1, 0.5, stats_text, transform=plt.gca().transAxes, fontsize=10,
+                    verticalalignment='center', fontfamily='monospace')
+            plt.axis('off')
+            
+            plt.tight_layout()
+            viz_file = os.path.join(self.training_report_dir, 'training_visualization.png')
+            plt.savefig(viz_file, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            print(f"Training visualization saved to: {viz_file}")
     
     def run(self, modelpool: BaseModelPool, **kwargs: Any) -> nn.Module:
         """
@@ -389,6 +517,9 @@ class LearnableFastfoodMergingAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         with self.profile("test-time adaptation"):
             module = self.test_time_adaptation(module)
         
+        # Save training report and visualizations
+        self._save_training_report(module)
+        
         # Save learned projection ratios if requested
         if self.save_projection_ratios:
             log.info(f"Saving learned projection ratios to {self.save_projection_ratios}")
@@ -396,6 +527,9 @@ class LearnableFastfoodMergingAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         
         with self.profile("merge and unload"):
             merged_model = module.merge_and_unload()
+        
+        # Save training report and visualizations
+        self._save_training_report(module)
         
         self.print_profile_summary()
         return merged_model
@@ -481,7 +615,17 @@ class LearnableFastfoodMergingAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             dynamic_ncols=True,
         )
         
+        # Reset training log
+        self.training_log = {
+            'losses': [],
+            'projection_ratios': [],
+            'step_times': []
+        }
+        
+        import time
+        
         for step_idx in pbar:
+            step_start_time = time.time()
             optimizer.zero_grad()
             
             # Accumulate loss across tasks
@@ -536,8 +680,21 @@ class LearnableFastfoodMergingAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             
             # Logging
             stats = module.get_projection_ratio_stats()
-            stats["train/loss"] = total_loss / len(self.modelpool.model_names)
+            avg_loss = total_loss / len(self.modelpool.model_names)
+            stats["train/loss"] = avg_loss
             pbar.set_postfix(stats)
+            
+            # Track training progress
+            step_end_time = time.time()
+            self.training_log['losses'].append(avg_loss)
+            self.training_log['step_times'].append(step_end_time - step_start_time)
+            
+            # Track projection ratios every 10 steps to avoid excessive memory usage
+            if step_idx % 10 == 0 or step_idx == self.max_steps - 1:
+                current_ratios = module.get_projection_ratios_for_analysis()
+                self.training_log['projection_ratios'].append({
+                    layer_name: float(ratio) for layer_name, ratio in current_ratios.items()
+                })
         
         log.info("Test-time adaptation completed")
         log.info(f"Final projection ratios - min: {stats['proj_ratio_min']:.4f}, "

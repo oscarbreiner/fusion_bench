@@ -1,3 +1,0 @@
-# flake8: noqa F401
-from .ada_fastfood_merging import AdaFastFoodMergingAlgorithm, AdaFastFoodMergedModel
-from .clip_ada_fastfood_merging import CLIPAdaFastFoodMergingAlgorithm

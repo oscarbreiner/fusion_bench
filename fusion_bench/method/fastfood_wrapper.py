@@ -543,27 +543,97 @@ class FastfoodWrapperAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         return (U_stack * fisher_weights).sum(dim=0)
 
     def _tsvm_merge_vectorized(self, U_stack: Tensor) -> Tensor:
-        """Vectorized TSVM implementation."""
+        """
+        Vectorized TSVM implementation following the reference algorithm.
+        
+        This implements the exact TSVM algorithm from the reference implementation:
+        1. For each task vector (already in projected space):
+           - Compute SVD: u, s, vh = svd(task_vector)  
+           - Keep only top 1/K fraction of singular values (sv_reduction)
+           - Concatenate the reduced components across tasks
+        2. After processing all tasks:
+           - Compute SVD of concatenated sum_u and sum_vh
+           - Merge: u_u @ vh_u @ diag(sum_s) @ u_vh @ vh_vh
+        
+        Args:
+            U_stack: [K, take, m] where K is number of models, take is block size, m is proj_dim
+                    These are already task vectors (deltas) in the projected space
+        
+        Returns:
+            Merged task vector of shape [take, m]
+        """
         alpha = self.method_config.get("alpha", 1.0)
         
-        # Flatten for SVD
         K, take, m = U_stack.shape
-        U_flat = U_stack.view(K, -1)  # [K, take*m]
+        num_tasks = K
         
-        # SVD to find dominant direction
+        # TSVM reduction factor: each task gets 1/K of the singular values
+        sv_reduction = 1.0 / num_tasks
+        
         try:
-            U_centered = U_flat - U_flat.mean(dim=0, keepdim=True)
-            U_svd, S, Vt = torch.svd(U_centered.T)  # [features, K]
+            # Lists to collect SVD components from all tasks
+            u_list = []
+            s_list = []
+            vh_list = []
             
-            # Use first singular vector as the merged direction
-            dominant = U_svd[:, 0]  # [features]
+            # Process each task vector
+            for i in range(num_tasks):
+                # Get task vector for this task: [take, m]
+                vec = U_stack[i]  # [take, m]
+                
+                # Ensure float32 for SVD (reference implementation does this)
+                if vec.dtype not in [torch.float32, torch.float64]:
+                    vec = vec.to(dtype=torch.float32)
+                
+                # Compute SVD of this task vector (2D matrix)
+                # vec = u @ diag(s) @ vh
+                u, s, vh = torch.linalg.svd(vec, full_matrices=False)
+                # u: [take, rank], s: [rank], vh: [rank, m]
+                # where rank = min(take, m)
+                
+                # Calculate how many singular values to keep for this task
+                reduced_index_s = max(1, int(s.shape[0] * sv_reduction))  # At least 1
+                
+                # Keep only the top singular values and corresponding vectors
+                u_reduced = u[:, :reduced_index_s]      # [take, reduced_rank]
+                s_reduced = s[:reduced_index_s]         # [reduced_rank]
+                vh_reduced = vh[:reduced_index_s, :]    # [reduced_rank, m]
+                
+                # Collect for concatenation
+                u_list.append(u_reduced)
+                s_list.append(s_reduced)
+                vh_list.append(vh_reduced)
             
-            # Scale by alpha and reshape back
-            result = alpha * dominant.view(take, m)
-            return result
+            # Concatenate all reduced SVD components along the rank dimension
+            # This creates larger matrices that contain information from all tasks
+            sum_u = torch.cat(u_list, dim=1)    # [take, total_reduced_rank]
+            sum_s = torch.cat(s_list, dim=0)    # [total_reduced_rank]
+            sum_vh = torch.cat(vh_list, dim=0)  # [total_reduced_rank, m]
             
-        except Exception:
+            # Stage 2: Orthogonalize the concatenated matrices via SVD
+            # This is the key TSVM step that reduces task interference
+            u_u, s_u, vh_u = torch.linalg.svd(sum_u, full_matrices=False)
+            u_vh, s_vh, vh_vh = torch.linalg.svd(sum_vh, full_matrices=False)
+            
+            # Merge using the TSVM formula
+            # result = (u_u @ vh_u) @ diag(sum_s) @ (u_vh @ vh_vh)
+            result = torch.linalg.multi_dot([
+                u_u,
+                vh_u,
+                torch.diag(sum_s),
+                u_vh,
+                vh_vh
+            ])
+            
+            # Apply alpha scaling if specified (matching reference behavior)
+            if alpha != 1.0:
+                result = alpha * result
+            
+            return result  # [take, m]
+            
+        except Exception as e:
             # Fallback to simple average if SVD fails
+            log.warning(f"TSVM SVD failed: {e}, falling back to simple average")
             return U_stack.mean(dim=0)
 
 # OLD METHODS REMOVED - Now processing each tensor individually like fastfood_merging.py

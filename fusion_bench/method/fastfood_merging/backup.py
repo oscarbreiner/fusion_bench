@@ -1,3 +1,5 @@
+anylise scope handling of this implementation. is it correct?
+
 # fastfood_merging.py
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple
@@ -40,31 +42,42 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
     Controls:
       subspace_scope: "per_tensor" | "layer" | "global"
       merge_where:    "subspace" | "postlift"
-      merge_func:     "sum" | "mean" | "max" | "signmax" | "ema" | "ties_sum" | "ties_mean" | "ties_max"
+      merge_func:     "sum" | "mean" | "max" | "signmax" | "ema" | "ties_sum" | "ties_mean" | "ties_max"  (zero-aware & disentangled)
       proj_ratio:     float (0..1)
       use_G:          bool
       block_rows:     int
       weights:        list[float] (donor weights; normalized internally)
       scale:          float (post-merge scale on Δ*)
       
-      # Task Arithmetic Reconstruction mode:
-      use_task_arithmetic_reconstruction: bool
-      task_arithmetic_scaling: float
-      report_reconstruction_error: bool
+      # Task Arithmetic Reconstruction mode (regularization test):
+      use_task_arithmetic_reconstruction: bool (enable task arithmetic + projection test, default False)
+      task_arithmetic_scaling: float (scaling factor for task arithmetic, default 0.3)
+      report_reconstruction_error: bool (report reconstruction error after projection, default False)
       
-      # Weight matching parameters:
-      use_weight_matching: bool
-      weight_matching_max_iter: int
-      weight_matching_seed: int
-      weight_matching_verbose: bool
-      weight_matching_input_shapes: tuple
+      # Weight matching parameters (optional preprocessing):
+      use_weight_matching: bool (enable weight matching before merging, default False)
+      weight_matching_max_iter: int (max iterations for weight matching, default 100)
+      weight_matching_seed: int (seed for reproducibility, default 0)
+      weight_matching_verbose: bool (verbose output, default True)
+      weight_matching_input_shapes: tuple (input shapes for model, default ((1,3,224,224),) for vision)
       
       # EMA-specific parameters (when merge_func="ema"):
       ema_task_order: "given" | "random" | "cosine_similarity" | "custom"
-      ema_gamma: float
-      ema_w_c: float
-      ema_w_s: float
-      ema_custom_order: list[str]
+      ema_gamma:      float (sigmoid scaling factor, default 1.2)
+      ema_w_c:        float (cosine alignment weight, default 0.6)
+      ema_w_s:        float (scale ratio weight, default 0.4)
+      ema_custom_order: list[str] (task names in desired order, when ema_task_order="custom")
+      
+      # Parameter selection & normalization:
+      linear_layers_only: bool (only merge linear layers in subspace; others in original space, default False)
+      exclude_parameters: list[str] (fnmatch patterns to exclude from subspace merging, e.g., ["*.running_*", "*position_embeddings*"])
+      nonlinear_merge_func: str (aggregation for non-subspace parameters: "sum" | "mean" | "max", default "mean")
+      normalize_layer_deltas: bool (pre-normalize donor deltas per layer to equal L2 or unit variance, default False)
+      normalization_mode: str ("l2" for equal norm | "variance" for unit variance, default "l2")
+      
+      # Performance optimization:
+      use_pinned_memory: bool (use pinned memory for faster CPU→GPU transfers, default True)
+      adaptive_block_rows: bool (adaptively adjust block_rows based on available VRAM, default False)
       
       ties_trim_pct, tadrop_tau, use_pareto: kept for API compatibility (unused)
     """
@@ -81,9 +94,9 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         weights: List[float] | None = None,
         scale: float = 1.0,
         # Task Arithmetic Reconstruction mode parameters
-        use_task_arithmetic_reconstruction: bool = False,
-        task_arithmetic_scaling: float = 1.0,
-        report_reconstruction_error: bool = False,
+        use_task_arithmetic_reconstruction: bool = False,  # Enable task arithmetic + projection test
+        task_arithmetic_scaling: float = 0.3,  # Scaling factor for task arithmetic
+        report_reconstruction_error: bool = False,  # Report reconstruction error
         # EMA-specific parameters
         ema_task_order: str = "given",   # "given" | "random" | "cosine_similarity" | "custom"
         ema_gamma: float = 1.2,          # sigmoid scaling factor
@@ -97,10 +110,19 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         weight_matching_verbose: bool = True,  # Verbose output for weight matching
         weight_matching_input_shapes: Tuple[Tuple[int, ...], ...] | None = None,  # Input shapes for spec generation
         # Analysis integration parameters
-        run_analysis: bool = False,
-        analysis_methods: List[str] = None,
-        analysis_output_path: str = None,
-        # Kept in signature for compatibility (not used)
+        run_analysis: bool = False,      # Whether to run integrated analysis after merging
+        analysis_methods: List[str] = None,  # List of analysis methods to run
+        analysis_output_path: str = None,    # Path for analysis outputs
+        # Parameter selection & normalization
+        linear_layers_only: bool = False,  # Only merge linear layers in subspace (non-linear merged in original space)
+        exclude_parameters: List[str] | None = None,  # Patterns to exclude from subspace merging (fnmatch style)
+        nonlinear_merge_func: str = "mean",  # Aggregation for non-linear parameters (sum, mean, max)
+        normalize_layer_deltas: bool = False,  # Pre-normalize donor deltas per layer (equal L2 or unit variance)
+        normalization_mode: str = "l2",  # "l2" (equal norm) or "variance" (unit variance)
+        # Performance optimization
+        use_pinned_memory: bool = True,  # Use pinned memory for faster CPU→GPU transfers
+        adaptive_block_rows: bool = False,  # Adaptively adjust block_rows based on available VRAM
+        # Kept in signature for compatibility (not used since align logic removed)
         ties_trim_pct: float = 0.0,
         tadrop_tau: float = 0.0,
         use_pareto: bool = False,
@@ -141,6 +163,19 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self.run_analysis = run_analysis
         self.analysis_methods = analysis_methods or []
         self.analysis_output_path = analysis_output_path
+        
+        # Parameter selection & normalization
+        self.linear_layers_only = bool(linear_layers_only)
+        self.exclude_parameters = list(exclude_parameters) if exclude_parameters is not None else []
+        self.nonlinear_merge_func = str(nonlinear_merge_func).lower()
+        assert self.nonlinear_merge_func in {"sum", "mean", "max"}, f"Invalid nonlinear_merge_func: {self.nonlinear_merge_func}"
+        self.normalize_layer_deltas = bool(normalize_layer_deltas)
+        self.normalization_mode = str(normalization_mode).lower()
+        assert self.normalization_mode in {"l2", "variance"}, f"Invalid normalization_mode: {self.normalization_mode}"
+        
+        # Performance optimization
+        self.use_pinned_memory = bool(use_pinned_memory)
+        self.adaptive_block_rows = bool(adaptive_block_rows)
 
     # ------------------- main -------------------
     @torch.no_grad()
@@ -269,12 +304,17 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     total_norm = 0.0
                     reconstruction_errors = []
                     
-                    # Identify eligible parameters
+                    # Determine global D if needed
                     keys_float_ta = [
                         k for k in tv_cpu.keys()
                         if torch.is_floating_point(tv_cpu[k])
                         and tv_cpu[k].ndim >= 1
                     ]
+                    
+                    global_D_ta = None
+                    if self.subspace_scope == "global":
+                        global_D_ta = max(tv_cpu[k].shape[-1] for k in keys_float_ta)
+                        print(f"[Projection Test] Global dimension: {global_D_ta}")
                     
                     # operator cache
                     op_cache_ta: Dict[Tuple[str, int, int], Tuple[Any, Any]] = {}
@@ -297,29 +337,15 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         
                         original_tv = tb.view(rows, d_last).float()
                         
-                        # Determine dimension based on scope
+                        # Build operator
                         seed_key = proj_seed_key_ta(name)
-                        
-                        if self.subspace_scope == "per_tensor":
-                            cur_D = d_last
-                        elif self.subspace_scope == "layer":
-                            # For layer scope, use actual dimension (conservative)
-                            cur_D = d_last
-                        else:  # global
-                            # For global scope, compute max dimension across eligible params
-                            if 'global_D_ta' not in locals():
-                                global_D_ta = max(tv_cpu[k].shape[-1] for k in keys_float_ta)
-                                print(f"[Projection Test] Global dimension: {global_D_ta}")
-                            cur_D = global_D_ta
-                        
-                        # Projection size based on actual dimension
+                        cur_D = global_D_ta if (global_D_ta is not None) else d_last
                         proj_dim = max(1, int(cur_D * self.proj_ratio))
                         cache_key = (seed_key, cur_D, proj_dim)
                         
                         if cache_key not in op_cache_ta:
                             fwd, lift = create_fastfood_ops(
-                                cur_D, proj_dim, seed_key=seed_key, device=dev, use_G=self.use_G, k_min=self.k_min,
-                                correct_for_pow2_padding=self.correct_for_pow2_padding
+                                cur_D, proj_dim, seed_key=seed_key, device=dev, use_G=self.use_G
                             )
                             op_cache_ta[cache_key] = (fwd, lift)
                         else:
@@ -334,19 +360,17 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                             take = min(rows - cursor, br)
                             sl = original_tv[cursor:cursor + take, :]
                             
-                            # Only pad if using shared operator sized for larger dimension
+                            # Pad to cur_D if needed
                             if cur_D > d_last:
-                                sl_input = torch.nn.functional.pad(sl, (0, cur_D - d_last))
+                                sl_padded = torch.zeros((take, cur_D), dtype=torch.float32, device="cpu")
+                                sl_padded[:, :d_last].copy_(sl)
+                                sl_input = sl_padded
                             else:
                                 sl_input = sl
                             
                             # Project down and up
                             Y = fwd(sl_input.to(dev, non_blocking=True))
-                            X_rec = lift(Y).to("cpu", non_blocking=True)
-                            
-                            # Extract only original dimension if padded
-                            if cur_D > d_last:
-                                X_rec = X_rec[:, :d_last]
+                            X_rec = lift(Y).to("cpu", non_blocking=True)[:, :d_last]
                             
                             reconstructed_tv[cursor:cursor + take, :] = X_rec
                             cursor += take
@@ -413,19 +437,87 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 self.print_profile_summary()
                 return model
 
-                # ---------- Eligible tensors ----------
+        # ---------- Eligible tensors ----------
         keys_all = list(base_sd.keys())
-        keys_float = [
-            k for k in keys_all
-            if (k in donors_sd[0])
-            and torch.is_floating_point(base_sd[k])
-            and base_sd[k].ndim >= 1
-            and all((k in d) and torch.is_floating_point(d[k]) and d[k].shape == base_sd[k].shape for d in donors_sd)
-        ]
+        
+        # Helper: check if parameter should be excluded
+        def should_exclude(param_name: str) -> bool:
+            """Check if parameter matches any exclusion pattern."""
+            for pattern in self.exclude_parameters:
+                if fnmatch.fnmatch(param_name, pattern):
+                    return True
+            return False
+        
+        # Helper: check if parameter is a linear layer
+        def is_linear_layer(param_name: str, param_tensor: Tensor) -> bool:
+            """Heuristic to identify linear layer weights."""
+            # Must be 2D (linear layers are 2D weight matrices)
+            if param_tensor.ndim != 2:
+                return False
+            
+            # Common patterns for linear layers in transformers and vision models
+            linear_patterns = [
+                "*.q_proj.*", "*.k_proj.*", "*.v_proj.*", "*.o_proj.*",  # Attention projections
+                "*.query.*", "*.key.*", "*.value.*", "*.dense.*",  # More attention
+                "*.fc*", "*.linear*",  # Fully connected layers
+                "*.mlp.*", "*.ffn.*",  # MLP/FFN layers
+                "*head.weight*",  # Classification heads
+            ]
+            # Exclude bias, normalization, embeddings, convolutions, patch embeddings
+            exclude_patterns = [
+                "*bias*", "*running_*", "*num_batches_tracked*",
+                "*LayerNorm*", "*BatchNorm*", "*GroupNorm*",
+                "*embedding*", "*position*", "*pos_embed*", "*cls_token*",
+                "patch_embed.*", "*conv*",  # Exclude patch embeddings and convolutions
+            ]
+            
+            # Check if matches linear pattern
+            is_linear = any(fnmatch.fnmatch(param_name.lower(), p.lower()) for p in linear_patterns)
+            # Check if matches exclusion pattern
+            is_excluded = any(fnmatch.fnmatch(param_name.lower(), p.lower()) for p in exclude_patterns)
+            
+            return is_linear and not is_excluded
+        
+        # Separate parameters into subspace-eligible and non-subspace
+        keys_float = []
+        keys_nonsubspace = []
+        
+        for k in keys_all:
+            # Basic eligibility: float, ndim>=1, same shape across all donors
+            is_eligible = (
+                (k in donors_sd[0])
+                and torch.is_floating_point(base_sd[k])
+                and base_sd[k].ndim >= 1
+                and all((k in d) and torch.is_floating_point(d[k]) and d[k].shape == base_sd[k].shape for d in donors_sd)
+            )
+            
+            if not is_eligible:
+                continue
+            
+            # Check exclusion patterns
+            if should_exclude(k):
+                keys_nonsubspace.append(k)
+                continue
+            
+            # Check linear-only mode
+            if self.linear_layers_only:
+                if is_linear_layer(k, base_sd[k]):
+                    keys_float.append(k)
+                else:
+                    keys_nonsubspace.append(k)
+            else:
+                keys_float.append(k)
+        
         K = len(donor_names)
-        print(f"[Setup] donors={K} | total tensors={len(keys_all)} | eligible float tensors={len(keys_float)}")
+        print(f"[Setup] donors={K} | total tensors={len(keys_all)} | subspace-eligible={len(keys_float)} | non-subspace={len(keys_nonsubspace)}")
+        
+        if self.linear_layers_only:
+            print(f"[Setup] Linear-only mode enabled: {len(keys_float)} linear layers in subspace, {len(keys_nonsubspace)} non-linear in original space")
+        
+        if self.exclude_parameters:
+            print(f"[Setup] Exclusion patterns: {self.exclude_parameters}")
 
-        if not keys_float:
+        if not keys_float and not keys_nonsubspace:
             raise RuntimeError("No overlapping float tensors with identical shapes. Nothing to merge.")
 
         # ---------- Weights ----------
@@ -489,9 +581,35 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             for (D, m), k in dims:
                 print(f"   - {k}: original_last_dim={int(base_sd[k].shape[-1])} | scoped_dim={D} → proj_dim={m} (compression={m/max(1,D):.3f})")
         
-                # Show EMA parameters if using EMA
+        # Show EMA parameters if using EMA
         if self.merge_func == "ema":
             print(f"[EMA] task_order={self.ema_task_order} | gamma={self.ema_gamma:.3f} | w_c={self.ema_w_c:.3f} | w_s={self.ema_w_s:.3f}")
+
+        # ---------- Adaptive Block Rows (VRAM-aware) ----------
+        if self.adaptive_block_rows and torch.cuda.is_available():
+            try:
+                # Get available VRAM
+                free_mem, total_mem = torch.cuda.mem_get_info(self.device)
+                free_gb = free_mem / (1024**3)
+                
+                # Heuristic: use larger blocks with more VRAM
+                # Conservative estimate: each row takes ~4KB (assuming ~1K dims * 4 bytes)
+                if free_gb > 20:
+                    adaptive_br = 32768
+                elif free_gb > 10:
+                    adaptive_br = 16384
+                elif free_gb > 5:
+                    adaptive_br = 8192
+                else:
+                    adaptive_br = 4096
+                
+                self.block_rows = adaptive_br
+                print(f"[Performance] Adaptive block_rows: {self.block_rows} (Free VRAM: {free_gb:.1f} GB)")
+            except Exception as e:
+                print(f"[Performance] Could not detect VRAM, using default block_rows={self.block_rows}: {e}")
+        
+        if self.use_pinned_memory:
+            print(f"[Performance] Pinned memory enabled for faster CPU↔GPU transfers")
 
         # ---------- Work on CPU copies ----------
         base_cpu = {k: v.detach().cpu().clone() for k, v in base_sd.items()}
@@ -508,6 +626,72 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         # Small sample for lift error (subspace only)
         lift_err_num = 0.0
         lift_err_den = 0.0
+        
+        # Helper: compute normalization factors per layer if needed
+        layer_norm_factors: Dict[str, Dict[int, float]] = {}  # {layer_name: {donor_idx: scale_factor}}
+        
+        if self.normalize_layer_deltas and self.subspace_scope == "layer":
+            print(f"\n[Normalization] Computing per-layer normalization factors (mode={self.normalization_mode})")
+            
+            # Group parameters by layer
+            layer_groups: Dict[str, List[str]] = {}
+            for name in keys_float:
+                lk = layer_key(name)
+                if lk not in layer_groups:
+                    layer_groups[lk] = []
+                layer_groups[lk].append(name)
+            
+            # Compute normalization per layer per donor
+            for lk, param_names in layer_groups.items():
+                layer_norm_factors[lk] = {}
+                
+                for donor_idx in range(K):
+                    # Compute total norm/variance across all params in this layer for this donor
+                    if self.normalization_mode == "l2":
+                        # Sum of squared norms across all layer parameters
+                        total_sq_norm = 0.0
+                        for name in param_names:
+                            tb = base_cpu[name]
+                            td = donors_cpu[donor_idx][name]
+                            delta = (td - tb).float()
+                            total_sq_norm += float(delta.pow(2).sum().item())
+                        
+                        # Normalization factor: 1/||Δ||_2
+                        layer_norm = math.sqrt(total_sq_norm) + EPS
+                        # Guard against tiny deltas (norm < 1e-6 means essentially zero change)
+                        if layer_norm < 1e-6:
+                            layer_norm_factors[lk][donor_idx] = 1.0  # No normalization for near-zero deltas
+                        else:
+                            layer_norm_factors[lk][donor_idx] = 1.0 / layer_norm
+                    
+                    elif self.normalization_mode == "variance":
+                        # Compute variance and normalize to unit variance
+                        all_deltas = []
+                        for name in param_names:
+                            tb = base_cpu[name]
+                            td = donors_cpu[donor_idx][name]
+                            delta = (td - tb).float().flatten()
+                            all_deltas.append(delta)
+                        
+                        if all_deltas:
+                            all_deltas_cat = torch.cat(all_deltas)
+                            var = all_deltas_cat.var().item()
+                            std = math.sqrt(var + EPS)
+                            # Guard against tiny variance
+                            if std < 1e-6:
+                                layer_norm_factors[lk][donor_idx] = 1.0
+                            else:
+                                layer_norm_factors[lk][donor_idx] = 1.0 / std
+                        else:
+                            layer_norm_factors[lk][donor_idx] = 1.0
+            
+            print(f"[Normalization] Computed normalization for {len(layer_groups)} layers")
+            # Show sample normalization factors
+            sample_layers = list(layer_groups.keys())[:3]
+            for lk in sample_layers:
+                factors = [layer_norm_factors[lk][i] for i in range(K)]
+                print(f"  {lk}: factors={[f'{f:.6f}' for f in factors]}")
+
 
         with self.profile("merging models"):
             for name in keys_float:
@@ -518,6 +702,11 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     continue
 
                 vb = tb.view(rows, d_last).float()
+                
+                # Use pinned memory if enabled
+                if self.use_pinned_memory:
+                    vb = vb.pin_memory()
+                
                 br = min(self.block_rows, rows)
 
                 # choose scoped dim & build (or reuse) operator
@@ -535,6 +724,10 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
                 cursor = 0
                 tensor_changed = False
+                
+                # Get layer-wise normalization factors if applicable
+                lk = layer_key(name) if self.normalize_layer_deltas and self.subspace_scope == "layer" else None
+                norm_factors = layer_norm_factors.get(lk, {}) if lk else {}
 
                 while cursor < rows:
                     take = min(rows - cursor, br)
@@ -542,25 +735,32 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
                     # donor deltas aligned to cur_D if global scope
                     Xs: List[Tensor] = []
-                    for dsd in donors_cpu:
+                    for donor_idx, dsd in enumerate(donors_cpu):
                         sl_donor = dsd[name].view(rows, d_last).float()[cursor:cursor + take, :]
                         delta = sl_donor - sl_base
+                        
+                        # Apply layer-wise normalization if enabled
+                        if donor_idx in norm_factors:
+                            delta = delta * norm_factors[donor_idx]
+                        
                         if global_D is not None and d_last < cur_D:
                             buf = torch.zeros((take, cur_D), dtype=torch.float32, device="cpu")
+                            if self.use_pinned_memory:
+                                buf = buf.pin_memory()
                             buf[:, :d_last].copy_(delta)
                             Xs.append(buf)
                         else:
+                            if self.use_pinned_memory:
+                                delta = delta.pin_memory()
                             Xs.append(delta)
 
-                    # project all donors
-                    Ys = [fwd(X.to(dev, non_blocking=True)) for X in Xs]
+                    # project all donors (use non_blocking for pinned memory)
+                    Ys = [fwd(X.to(dev, non_blocking=self.use_pinned_memory)) for X in Xs]
 
                     # mix in chosen space
                     if self.merge_where == "postlift":
                         # reconstruct donors first, then aggregate in original space
-                        Xhats_raw = [lift(Y).to("cpu", non_blocking=False) for Y in Ys]
-                        # Extract only original dimension if padded
-                        Xhats = [X[:, :d_last] if cur_D > d_last else X for X in Xhats_raw]
+                        Xhats = [lift(Y).to("cpu", non_blocking=self.use_pinned_memory)[:, :d_last] for Y in Ys]
                         U_stack = torch.stack(Xhats, dim=0)  # [K, take, d]
                         Xmerge = _zero_aware_aggregate(
                             U_stack,
@@ -571,7 +771,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                             ema_w_c=self.ema_w_c,
                             ema_w_s=self.ema_w_s,
                             ema_custom_order=ema_custom_indices,
-                        ).to("cpu", non_blocking=False)
+                        ).to("cpu", non_blocking=self.use_pinned_memory)
                     else:
                         # aggregate in subspace, then lift once
                         U_stack = torch.stack(Ys, dim=0)  # [K, take, m]
@@ -585,25 +785,18 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                             ema_w_s=self.ema_w_s,
                             ema_custom_order=ema_custom_indices,
                         )
-                        Xmerge_full = lift(Ymerge).to("cpu", non_blocking=False)  # [take, cur_D or d_last]
-                        # Extract only original dimension if padded
-                        Xmerge = Xmerge_full[:, :d_last] if cur_D > d_last else Xmerge_full
+                        Xmerge_full = lift(Ymerge).to("cpu", non_blocking=self.use_pinned_memory)  # [take, cur_D]
+                        Xmerge = Xmerge_full[:, :d_last]
 
                         # accumulate lift reconstruction error stats on a tiny slice
                         if take > 0 and (lift_err_den < 1e8):  # guard cost
                             # pick the first donor to estimate lift error
-                            X0 = Xs[0].to(dev, non_blocking=False)
+                            X0 = Xs[0].to(dev, non_blocking=self.use_pinned_memory)
                             Y0 = Ys[0]
-                            X0_rec = lift(Y0).to("cpu", non_blocking=False)
-                            # Extract only original dimension if padded
-                            if cur_D > d_last:
-                                X0_rec = X0_rec[:, :d_last]
-                                X0_orig = Xs[0][:, :d_last]
-                            else:
-                                X0_orig = Xs[0]
-                            diff = (X0_rec.to(torch.float32) - X0_orig.to(torch.float32))
+                            X0_rec = lift(Y0).to("cpu", non_blocking=self.use_pinned_memory)[:, :d_last]
+                            diff = (X0_rec.to(torch.float32) - Xs[0][:, :d_last].to(torch.float32))
                             lift_err_num += float(diff.pow(2).sum().item())
-                            lift_err_den += float(X0_orig.pow(2).sum().item())
+                            lift_err_den += float(Xs[0][:, :d_last].pow(2).sum().item())
 
                     # write back (scale)
                     upd = (self.scale * Xmerge).to(sl_base.dtype)
@@ -627,6 +820,45 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 merged_tensors += 1
                 if tensor_changed:
                     changed_params += 1
+            
+            # ---------- Merge Non-Subspace Parameters (Original Space) ----------
+            if keys_nonsubspace:
+                print(f"\n[Non-Subspace] Merging {len(keys_nonsubspace)} parameters in original space (func={self.nonlinear_merge_func})")
+                
+                for name in keys_nonsubspace:
+                    tb = base_cpu[name]
+                    
+                    # Collect donor deltas
+                    deltas: List[Tensor] = []
+                    for dsd in donors_cpu:
+                        delta = (dsd[name] - tb).float()
+                        deltas.append(delta)
+                    
+                    # Stack deltas: [K, ...original_shape...]
+                    delta_stack = torch.stack(deltas, dim=0)
+                    
+                    # Use zero_aware_aggregate to respect weights and support all merge functions
+                    # This ensures EMA/TIES variants work identically for non-subspace params
+                    merged_delta = _zero_aware_aggregate(
+                        delta_stack,
+                        merge_func=self.nonlinear_merge_func,
+                        weights=w if self.nonlinear_merge_func in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"} else None,
+                        ema_task_order=self.ema_task_order if self.nonlinear_merge_func == "ema" else "given",
+                        ema_gamma=self.ema_gamma if self.nonlinear_merge_func == "ema" else 1.2,
+                        ema_w_c=self.ema_w_c if self.nonlinear_merge_func == "ema" else 0.6,
+                        ema_w_s=self.ema_w_s if self.nonlinear_merge_func == "ema" else 0.4,
+                        ema_custom_order=ema_custom_indices if self.nonlinear_merge_func == "ema" else None,
+                    )
+                    
+                    # Apply to base
+                    upd = (self.scale * merged_delta).to(tb.dtype)
+                    base_cpu[name] = tb + upd
+                    
+                    merged_tensors += 1
+                    if upd.abs().max().item() > 0:
+                        changed_params += 1
+                
+                print(f"[Non-Subspace] Merged {len(keys_nonsubspace)} parameters")
             
             # Clear cache once after all merging is done
             if torch.cuda.is_available():

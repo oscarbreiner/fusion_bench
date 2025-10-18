@@ -89,22 +89,13 @@ def create_fastfood_ops(
     use_G: bool,
 ) -> Tuple[Callable[[Tensor], Tensor], Callable[[Tensor], Tensor]]:
     """
-    Build Fastfood/SRHT projection operators for dimension reduction.
-    
-    The Fastfood operator is: V = H Π G H B ∈ R^{L×L}, where L = 2^⌈log2 D⌉
-    P is a random row subset of size m = proj_dim (subsampled SRHT)
-    
-    Args:
-        global_dim: Original dimension D
-        proj_dim: Target projection dimension m
-        seed_key: String used to seed random generation (for reproducibility)
-        device: Torch device for computation
-        use_G: Whether to use Gaussian scaling (G matrix)
-        
-    Returns:
-        Tuple of (fwd, lift) functions:
-        - fwd(x): Projects x from D dimensions to m dimensions
-        - lift(y): Lifts y from m dimensions back to D dimensions
+    Build a Fastfood operator with:
+      V = H Π G H B ∈ R^{L×L}, L = 2^⌈log2 D⌉
+      P = random row subset of size m = proj_dim
+    We return:
+      fwd(x)  = sqrt(L/m) * P V [x; 0]
+      lift(y) = V^T P^T (y / sqrt(L/m))
+    The same (B, G, Π, P) are reused for all tensors sharing `seed_key`.
     """
     torch.manual_seed(seed_from_string(seed_key))
     D = int(global_dim)
@@ -128,7 +119,6 @@ def create_fastfood_ops(
     scale = math.sqrt(L / m)
 
     def fwd(xD: Tensor) -> Tensor:
-        """Forward projection: D → m dimensions."""
         assert xD.shape[-1] == D
         x = xD
         if D < L:
@@ -143,7 +133,6 @@ def create_fastfood_ops(
         return (scale * x).contiguous()
 
     def lift(y: Tensor) -> Tensor:
-        """Inverse/lift operation: m → D dimensions."""
         y = (y.to(torch.float32, copy=False) / scale)
         y_full = torch.zeros(y.shape[:-1] + (L,), dtype=torch.float32, device=y.device)
         y_full.index_copy_(dim=-1, index=row_idx, source=y)  # P^T y

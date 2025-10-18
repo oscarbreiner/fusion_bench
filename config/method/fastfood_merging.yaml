@@ -27,7 +27,11 @@ weight_matching_input_shapes: # Custom input shapes for permutation spec generat
 # ============================================================================
 # Subspace Configuration
 # ============================================================================
-subspace_scope: "global"     # per_tensor | layer | global
+subspace_scope: "global"     # per_tensor | per_flat_tensor | layer | global
+                              # - per_tensor: row-wise projection (standard)
+                              # - per_flat_tensor: flatten 2D to (out*in), one projection
+                              # - layer: layer-wise shared projection
+                              # - global: single global projection for all params
 merge_where: "subspace"       # subspace | postlift
 
 # ============================================================================
@@ -67,6 +71,12 @@ ema_custom_order:
 # ============================================================================
 ties_trim_pct: 0.0            # TIES pruning percentage (0.0-1.0)
 tadrop_tau: 0.0               # Task Arithmetic dropout threshold
+
+# ============================================================================
+# TSV-Style Linear/Non-Linear Separation
+# ============================================================================
+only_project_linear: false    # If true, only 2D tensors are projected; 1D tensors merged with mean in original space
+                              # This mimics TSV behavior: linear layers (weights) use subspace, non-linear (biases, norms) use mean
 
 # ============================================================================
 # Post-processing Options

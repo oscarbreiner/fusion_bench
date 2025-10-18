@@ -38,7 +38,11 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
     Task-vector merging via Fastfood/SRHT subspaces.
 
     Controls:
-      subspace_scope: "per_tensor" | "layer" | "global"
+      subspace_scope: "per_tensor" | "per_flat_tensor" | "layer" | "global"
+                      - "per_tensor": row-wise projection on 2D tensors (rows x in_dim)
+                      - "per_flat_tensor": flatten 2D tensors to (out·in) and apply one projection
+                      - "layer": layer-wise projection
+                      - "global": global projection across all parameters
       merge_where:    "subspace" | "postlift"
       merge_func:     "sum" | "mean" | "max" | "signmax" | "ema" | "ties_sum" | "ties_mean" | "ties_max"
       proj_ratio:     float (0..1)
@@ -66,6 +70,9 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
       ema_w_s: float
       ema_custom_order: list[str]
       
+      # TSV-style linear/non-linear separation:
+      only_project_linear: bool (if True, only 2D tensors are projected; 1D tensors use mean in original space)
+      
       ties_trim_pct, tadrop_tau, use_pareto: kept for API compatibility (unused)
     """
 
@@ -74,7 +81,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         proj_ratio: float = 0.10,
         use_G: bool = False,
         device: str = "cuda",
-        subspace_scope: str = "global",  # "per_tensor" | "layer" | "global"
+        subspace_scope: str = "global",  # "per_tensor" | "per_flat_tensor" | "layer" | "global"
         merge_where: str = "subspace",   # "subspace" | "postlift"
         merge_func: str = "sum",         # "sum" | "mean" | "max" | "signmax" | "ema"
         block_rows: int = 8192,
@@ -100,6 +107,8 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         run_analysis: bool = False,
         analysis_methods: List[str] = None,
         analysis_output_path: str = None,
+        # TSV-style linear/non-linear separation
+        only_project_linear: bool = False,  # Only project 2D tensors; merge 1D tensors in original space
         # Kept in signature for compatibility (not used)
         ties_trim_pct: float = 0.0,
         tadrop_tau: float = 0.0,
@@ -136,6 +145,9 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self.weight_matching_seed = int(weight_matching_seed)
         self.weight_matching_verbose = bool(weight_matching_verbose)
         self.weight_matching_input_shapes = weight_matching_input_shapes
+        
+        # TSV-style linear/non-linear separation
+        self.only_project_linear = bool(only_project_linear)
         
         # Analysis parameters
         self.run_analysis = run_analysis
@@ -422,6 +434,16 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             and base_sd[k].ndim >= 1
             and all((k in d) and torch.is_floating_point(d[k]) and d[k].shape == base_sd[k].shape for d in donors_sd)
         ]
+        
+        # Separate linear (2D) and non-linear (1D or other) weights if only_project_linear is enabled
+        if self.only_project_linear:
+            keys_linear = [k for k in keys_float if base_sd[k].ndim == 2]
+            keys_nonlinear = [k for k in keys_float if base_sd[k].ndim != 2]
+            print(f"[only_project_linear] linear (2D) tensors={len(keys_linear)} | non-linear tensors={len(keys_nonlinear)}")
+        else:
+            keys_linear = keys_float
+            keys_nonlinear = []
+        
         K = len(donor_names)
         print(f"[Setup] donors={K} | total tensors={len(keys_all)} | eligible float tensors={len(keys_float)}")
 
@@ -464,7 +486,9 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 return "__GLOBAL__"
             if self.subspace_scope == "layer":
                 return _layer_key(param_name)
-            return param_name  # per_tensor
+            # per_tensor and per_flat_tensor both use param_name as key
+            # (they differ in how the tensor is processed, not the seed)
+            return param_name
 
         # Determine global D (max last-dim) if needed
         global_D = None
@@ -477,8 +501,13 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
         # Report subspace sizing (first few examples)
         def _dim_for(k: str) -> Tuple[int, int]:
-            d_last = int(base_sd[k].shape[-1])
-            cur_D = global_D if (global_D is not None) else d_last
+            t = base_sd[k]
+            if self.subspace_scope == "per_flat_tensor" and t.ndim == 2:
+                # For per_flat_tensor, use total number of elements
+                cur_D = t.numel()
+            else:
+                d_last = int(t.shape[-1])
+                cur_D = global_D if (global_D is not None) else d_last
             m = max(1, int(cur_D * self.proj_ratio))
             return cur_D, m
 
@@ -510,13 +539,122 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         lift_err_den = 0.0
 
         with self.profile("merging models"):
-            for name in keys_float:
+            # ---------- Process non-linear weights (1D) with mean in original space ----------
+            if self.only_project_linear and keys_nonlinear:
+                print(f"[Merging non-linear weights] Processing {len(keys_nonlinear)} non-linear tensors with mean in original space")
+                for name in keys_nonlinear:
+                    # Use running mean like TSV does
+                    result = base_cpu[name].clone().float()
+                    for i, dsd in enumerate(donors_cpu):
+                        donor_val = dsd[name].float()
+                        result += (donor_val - result) / (i + 2)  # i+2 because base is index 0, first donor is index 1
+                    
+                    # Apply scale and write back
+                    update = (result - base_cpu[name].float()) * self.scale
+                    base_cpu[name].add_(update.to(base_cpu[name].dtype))
+                    
+                    merged_tensors += 1
+                    if update.abs().max().item() > 0:
+                        changed_params += 1
+            
+            # ---------- Process linear weights (2D) with projection ----------
+            for name in keys_linear:
                 tb = base_cpu[name]
                 d_last = int(tb.shape[-1])
                 rows = tb.numel() // d_last
                 if rows <= 0:
                     continue
 
+                # Special case: per_flat_tensor - flatten entire 2D weight and apply single projection
+                if self.subspace_scope == "per_flat_tensor":
+                    # Flatten entire tensor to (out_dim * in_dim)
+                    flat_dim = tb.numel()
+                    vb_flat = tb.view(-1).float()  # [out*in]
+                    
+                    # Create projection for flattened dimension
+                    seed_key = proj_seed_key(name)
+                    cur_D = flat_dim
+                    proj_dim = max(1, int(cur_D * self.proj_ratio))
+                    cache_key = (seed_key, cur_D, proj_dim)
+                    
+                    if cache_key not in op_cache:
+                        fwd, lift = _fastfood_ops(
+                            cur_D, proj_dim, seed_key=seed_key, device=dev, use_G=self.use_G
+                        )
+                        op_cache[cache_key] = (fwd, lift)
+                    else:
+                        fwd, lift = op_cache[cache_key]
+                    
+                    # Collect flattened donor deltas
+                    Xs: List[Tensor] = []
+                    for dsd in donors_cpu:
+                        donor_flat = dsd[name].view(-1).float()
+                        delta = donor_flat - vb_flat
+                        Xs.append(delta)
+                    
+                    # Project all donors
+                    Ys = [fwd(X.to(dev, non_blocking=True)) for X in Xs]
+                    
+                    # Mix in chosen space
+                    if self.merge_where == "postlift":
+                        # Reconstruct donors first, then aggregate in original space
+                        Xhats = [lift(Y).to("cpu", non_blocking=False) for Y in Ys]
+                        U_stack = torch.stack(Xhats, dim=0)  # [K, flat_dim]
+                        Xmerge = _zero_aware_aggregate(
+                            U_stack,
+                            merge_func=self.merge_func,
+                            weights=w if self.merge_func in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"} else None,
+                            ema_task_order=self.ema_task_order,
+                            ema_gamma=self.ema_gamma,
+                            ema_w_c=self.ema_w_c,
+                            ema_w_s=self.ema_w_s,
+                            ema_custom_order=ema_custom_indices,
+                        ).to("cpu", non_blocking=False)
+                    else:
+                        # Aggregate in subspace, then lift once
+                        U_stack = torch.stack(Ys, dim=0)  # [K, proj_dim]
+                        Ymerge = _zero_aware_aggregate(
+                            U_stack,
+                            merge_func=self.merge_func,
+                            weights=w if self.merge_func in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"} else None,
+                            ema_task_order=self.ema_task_order,
+                            ema_gamma=self.ema_gamma,
+                            ema_w_c=self.ema_w_c,
+                            ema_w_s=self.ema_w_s,
+                            ema_custom_order=ema_custom_indices,
+                        )
+                        Xmerge = lift(Ymerge).to("cpu", non_blocking=False)  # [flat_dim]
+                        
+                        # Accumulate lift reconstruction error stats
+                        if lift_err_den < 1e8:
+                            X0 = Xs[0].to(dev, non_blocking=False)
+                            Y0 = Ys[0]
+                            X0_rec = lift(Y0).to("cpu", non_blocking=False)
+                            diff = (X0_rec.to(torch.float32) - Xs[0].to(torch.float32))
+                            lift_err_num += float(diff.pow(2).sum().item())
+                            lift_err_den += float(Xs[0].pow(2).sum().item())
+                    
+                    # Apply scale and reshape back to original shape
+                    upd = (self.scale * Xmerge).view_as(tb).to(tb.dtype)
+                    
+                    # Trust-region: prevent blow-ups
+                    max_ratio = 2.0
+                    upd_norm = upd.norm().item()
+                    base_norm = tb.norm().item() + 1e-12
+                    if upd_norm > max_ratio * base_norm:
+                        scale_factor = (max_ratio * base_norm) / (upd_norm + 1e-12)
+                        upd = upd * scale_factor
+                    
+                    # Write back
+                    tb.add_(upd)
+                    
+                    merged_tensors += 1
+                    if upd.abs().max().item() > 0:
+                        changed_params += 1
+                    
+                    continue  # Skip row-wise processing for this tensor
+                
+                # Standard processing: row-wise projection
                 vb = tb.view(rows, d_last).float()
                 br = min(self.block_rows, rows)
 

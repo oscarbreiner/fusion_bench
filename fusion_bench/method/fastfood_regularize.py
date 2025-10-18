@@ -42,7 +42,6 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
     
     Parameters:
         proj_ratio: Compression ratio (0.0-1.0), e.g., 0.5 = 50% compression
-        k_min: Minimum projection dimension (default 64, protects tiny tensors)
         use_G: Use Gaussian scaling in Fastfood transform
         device: Computation device (cuda/cpu)
         subspace_scope: "per_tensor" | "layer" | "global"
@@ -60,7 +59,6 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         device: str = "cuda",
         subspace_scope: str = "global",
         block_rows: int = 8192,
-        k_min: int = 64,
         exclude_parameters: List[str] | None = None,
         **kwargs: Any,
     ):
@@ -70,13 +68,12 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self.device = torch.device(device)
         self.subspace_scope = str(subspace_scope)
         self.block_rows = int(block_rows)
-        self.k_min = int(k_min)
         self.exclude_parameters = list(exclude_parameters) if exclude_parameters is not None else [
             "*norm*", "*bias*", "*pos_embed*", "*cls_token*", "patch_embed.*", 
             "*running_*", "*num_batches_tracked*"
         ]
         
-        log.info(f"FastFood Regularize initialized: proj_ratio={proj_ratio}, scope={subspace_scope}, k_min={k_min}")
+        log.info(f"FastFood Regularize initialized: proj_ratio={proj_ratio}, scope={subspace_scope}")
     
     def _should_exclude(self, param_name: str) -> bool:
         """Check if parameter should be excluded from projection."""
@@ -176,7 +173,7 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             
             if cache_key not in op_cache:
                 fwd, lift = create_fastfood_ops(
-                    cur_D, proj_dim, seed_key=seed_key, device=dev, use_G=self.use_G, k_min=self.k_min
+                    cur_D, proj_dim, seed_key=seed_key, device=dev, use_G=self.use_G
                 )
                 op_cache[cache_key] = (fwd, lift)
             else:

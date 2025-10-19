@@ -14,6 +14,19 @@ device: "cuda"                # Computation device
 block_rows: 16384             # Memory management for large tensors
 
 # ============================================================================
+# Adaptive Projection Size Estimation (Optional)
+# ============================================================================
+use_adaptive_proj_size: false # Enable adaptive projection size estimation
+adaptive_proj_mode: "tensor"  # "tensor" | "layer" (scope for rank estimation)
+adaptive_proj_strategy: "rank" # "fixed" | "random" | "rank"
+adaptive_proj_m_min: 64       # Minimum projection size
+adaptive_proj_f_max: 0.5      # Maximum fraction of d_last
+adaptive_proj_pow2: true      # Round to power-of-2
+adaptive_proj_pow2_mode: "ceil" # "ceil" | "floor" | "nearest"
+adaptive_proj_beta: 2.5       # For "rank" strategy: m = beta * estimated_rank
+adaptive_proj_seed: null      # Random seed for "random" strategy (null = use global random)
+
+# ============================================================================
 # Weight Matching Preprocessing (Optional - Git Re-Basin)
 # ============================================================================
 use_weight_matching: false    # Enable weight matching to align neurons before merging

@@ -25,6 +25,14 @@ from .fastfood_utils import (
     compute_global_dim
 )
 
+# Import projection size estimator for adaptive sizing
+from .projection_size_estimator import (
+    ProjSizeCfg,
+    proj_size_for,
+    Mode,
+    Strategy
+)
+
 # Keep backward compatibility by re-exporting under old names
 _fastfood_ops = create_fastfood_ops
 _zero_aware_aggregate = zero_aware_aggregate
@@ -45,7 +53,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                       - "global": global projection across all parameters
       merge_where:    "subspace" | "postlift"
       merge_func:     "sum" | "mean" | "max" | "signmax" | "ema" | "ties_sum" | "ties_mean" | "ties_max"
-      proj_ratio:     float (0..1)
+      proj_ratio:     float (0..1) - used for fixed sizing or as ratio parameter in adaptive config
       use_G:          bool
       block_rows:     int
       weights:        list[float] (donor weights; normalized internally)
@@ -72,6 +80,22 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
       
       # TSV-style linear/non-linear separation:
       only_project_linear: bool (if True, only 2D tensors are projected; 1D tensors use mean in original space)
+      
+      # Adaptive projection sizing (optional):
+      use_adaptive_proj_size: bool - enable rank-based adaptive projection sizing
+      adaptive_proj_mode: "tensor" | "layer" - scope for rank estimation
+      adaptive_proj_strategy: "fixed" | "random" | "rank" - sizing strategy
+        - "fixed": m = ratio * d_last (uses proj_ratio)
+        - "random": m ~ U[m_min, f_max * d_last]
+        - "rank": m = beta * estimated_rank
+          - tensor mode: uses stable rank (||W||_F^2 / ||W||_2^2) via power iteration
+          - layer mode: uses effective rank (entropy-based) from SVD variance spectrum
+      adaptive_proj_m_min: int - minimum projection size
+      adaptive_proj_f_max: float - maximum fraction of d_last
+      adaptive_proj_pow2: bool - round to power-of-2
+      adaptive_proj_pow2_mode: "ceil" | "floor" | "nearest"
+      adaptive_proj_beta: float - for rank strategy: m = beta * rank
+      adaptive_proj_seed: int | None - random seed for random strategy
       
       ties_trim_pct, tadrop_tau, use_pareto: kept for API compatibility (unused)
     """
@@ -109,6 +133,16 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         analysis_output_path: str = None,
         # TSV-style linear/non-linear separation
         only_project_linear: bool = False,  # Only project 2D tensors; merge 1D tensors in original space
+        # Adaptive projection size estimation
+        use_adaptive_proj_size: bool = False,  # Enable adaptive projection sizing
+        adaptive_proj_mode: str = "tensor",  # "tensor" | "layer"
+        adaptive_proj_strategy: str = "rank",  # "fixed" | "random" | "rank"
+        adaptive_proj_m_min: int = 16,  # Minimum projection size
+        adaptive_proj_f_max: float = 0.5,  # Maximum fraction of d_last
+        adaptive_proj_pow2: bool = True,  # Round to power-of-2
+        adaptive_proj_pow2_mode: str = "ceil",  # "ceil" | "floor" | "nearest"
+        adaptive_proj_beta: float = 2.5,  # For rank strategy: m = beta * rank
+        adaptive_proj_seed: int | None = None,  # Random seed for random strategy
         # Kept in signature for compatibility (not used)
         ties_trim_pct: float = 0.0,
         tadrop_tau: float = 0.0,
@@ -149,10 +183,81 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         # TSV-style linear/non-linear separation
         self.only_project_linear = bool(only_project_linear)
         
+        # Adaptive projection size estimation
+        self.use_adaptive_proj_size = bool(use_adaptive_proj_size)
+        self.adaptive_proj_mode = str(adaptive_proj_mode)
+        self.adaptive_proj_strategy = str(adaptive_proj_strategy)
+        
+        # Initialize projection size config if adaptive sizing is enabled
+        if self.use_adaptive_proj_size:
+            import random as _random
+            self.proj_size_cfg = ProjSizeCfg(
+                m_min=int(adaptive_proj_m_min),
+                f_max=float(adaptive_proj_f_max),
+                pow2_round=bool(adaptive_proj_pow2),
+                pow2_mode=str(adaptive_proj_pow2_mode),
+                ratio=self.proj_ratio,  # Use main proj_ratio for fixed strategy
+                beta=float(adaptive_proj_beta),
+                rng=_random.Random(adaptive_proj_seed) if adaptive_proj_seed is not None else None
+            )
+        else:
+            self.proj_size_cfg = None
+        
         # Analysis parameters
         self.run_analysis = run_analysis
         self.analysis_methods = analysis_methods or []
         self.analysis_output_path = analysis_output_path
+
+    # ------------------- helpers -------------------
+    def _compute_proj_size(
+        self, 
+        param_name: str,
+        tensor: torch.Tensor,
+        layer_params: Dict[str, torch.Tensor] | None = None
+    ) -> int:
+        """
+        Compute projection size for a parameter tensor.
+        
+        If adaptive sizing is enabled, uses the projection size estimator.
+        Otherwise, uses the fixed proj_ratio.
+        
+        Args:
+            param_name: Name of the parameter
+            tensor: The parameter tensor
+            layer_params: Optional dict of layer parameters (for layer mode)
+            
+        Returns:
+            Projection size m
+        """
+        if not self.use_adaptive_proj_size:
+            # Fixed ratio mode (original behavior)
+            d_last = int(tensor.shape[-1])
+            if self.subspace_scope == "global" and hasattr(self, '_global_D'):
+                cur_D = self._global_D
+            elif self.subspace_scope == "per_flat_tensor" and tensor.ndim == 2:
+                cur_D = tensor.numel()
+            else:
+                cur_D = d_last
+            return max(1, int(cur_D * self.proj_ratio))
+        
+        # Adaptive sizing mode
+        try:
+            mode: Mode = self.adaptive_proj_mode  # type: ignore
+            strategy: Strategy = self.adaptive_proj_strategy  # type: ignore
+            
+            if mode == "layer":
+                if layer_params is None:
+                    raise ValueError("layer_params required for adaptive layer mode")
+                m = proj_size_for(layer_params, mode="layer", strategy=strategy, cfg=self.proj_size_cfg)
+            else:  # tensor mode
+                m = proj_size_for(tensor, mode="tensor", strategy=strategy, cfg=self.proj_size_cfg)
+            
+            return m
+        except Exception as e:
+            print(f"[Adaptive Proj Size] Error for {param_name}: {e}, falling back to fixed ratio")
+            # Fallback to fixed ratio on error
+            d_last = int(tensor.shape[-1])
+            return max(1, int(d_last * self.proj_ratio))
 
     # ------------------- main -------------------
     @torch.no_grad()
@@ -324,14 +429,25 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                                 print(f"[Projection Test] Global dimension: {global_D_ta}")
                             cur_D = global_D_ta
                         
-                        # Projection size based on actual dimension
-                        proj_dim = max(1, int(cur_D * self.proj_ratio))
+                        # Compute projection size (adaptive or fixed)
+                        if self.use_adaptive_proj_size:
+                            # Use adaptive sizing for task arithmetic too
+                            if self.adaptive_proj_mode == "layer":
+                                # For layer mode, group task vector params by layer
+                                lkey = layer_key(name)
+                                layer_params_ta = {k: tv_cpu[k] for k in keys_float_ta if layer_key(k) == lkey}
+                                proj_dim = self._compute_proj_size(name, tb, layer_params_ta)
+                            else:
+                                proj_dim = self._compute_proj_size(name, tb)
+                        else:
+                            # Fixed ratio mode
+                            proj_dim = max(1, int(cur_D * self.proj_ratio))
+                        
                         cache_key = (seed_key, cur_D, proj_dim)
                         
                         if cache_key not in op_cache_ta:
                             fwd, lift = create_fastfood_ops(
-                                cur_D, proj_dim, seed_key=seed_key, device=dev, use_G=self.use_G, k_min=self.k_min,
-                                correct_for_pow2_padding=self.correct_for_pow2_padding
+                                cur_D, proj_dim, seed_key=seed_key, device=dev, use_G=self.use_G
                             )
                             op_cache_ta[cache_key] = (fwd, lift)
                         else:
@@ -498,6 +614,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 t = base_sd[k]
                 maxd = max(maxd, int(t.shape[-1]))
             global_D = maxd
+            self._global_D = global_D  # Store for adaptive sizing helper
 
         # Report subspace sizing (first few examples)
         def _dim_for(k: str) -> Tuple[int, int]:
@@ -518,7 +635,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             for (D, m), k in dims:
                 print(f"   - {k}: original_last_dim={int(base_sd[k].shape[-1])} | scoped_dim={D} → proj_dim={m} (compression={m/max(1,D):.3f})")
         
-                # Show EMA parameters if using EMA
+        # Show EMA parameters if using EMA
         if self.merge_func == "ema":
             print(f"[EMA] task_order={self.ema_task_order} | gamma={self.ema_gamma:.3f} | w_c={self.ema_w_c:.3f} | w_s={self.ema_w_s:.3f}")
 
@@ -526,8 +643,22 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         base_cpu = {k: v.detach().cpu().clone() for k, v in base_sd.items()}
         donors_cpu = [{k: v.detach().cpu().clone() for k, v in d.items()} for d in donors_sd]
         dev = self.device
-
-        # ---------- Merge ----------
+        
+        # Adaptive projection size initialization (after base_cpu is created)
+        if self.use_adaptive_proj_size:
+            print(f"[Adaptive Proj Size] mode={self.adaptive_proj_mode} | strategy={self.adaptive_proj_strategy} | beta={self.proj_size_cfg.beta:.2f}")
+            
+            # Precompute layer groups for layer mode
+            if self.adaptive_proj_mode == "layer":
+                self._layer_groups: Dict[str, Dict[str, torch.Tensor]] = {}
+                for k in keys_linear:
+                    lkey = layer_key(k)
+                    if lkey not in self._layer_groups:
+                        self._layer_groups[lkey] = {}
+                    self._layer_groups[lkey][k] = base_cpu[k]
+                print(f"[Adaptive Proj Size] Grouped {len(keys_linear)} tensors into {len(self._layer_groups)} layers")
+            else:
+                self._layer_groups = None        # ---------- Merge ----------
         merged_tensors = 0
         changed_params = 0
 
@@ -571,10 +702,18 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     flat_dim = tb.numel()
                     vb_flat = tb.view(-1).float()  # [out*in]
                     
+                    # Compute projection size (adaptive or fixed)
+                    if self.use_adaptive_proj_size and self.adaptive_proj_mode == "layer":
+                        # For layer mode, get layer params
+                        lkey = layer_key(name)
+                        layer_params = self._layer_groups.get(lkey, {name: tb})
+                        proj_dim = self._compute_proj_size(name, tb, layer_params)
+                    else:
+                        proj_dim = self._compute_proj_size(name, tb)
+                    
                     # Create projection for flattened dimension
                     seed_key = proj_seed_key(name)
                     cur_D = flat_dim
-                    proj_dim = max(1, int(cur_D * self.proj_ratio))
                     cache_key = (seed_key, cur_D, proj_dim)
                     
                     if cache_key not in op_cache:
@@ -658,10 +797,18 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 vb = tb.view(rows, d_last).float()
                 br = min(self.block_rows, rows)
 
-                # choose scoped dim & build (or reuse) operator
+                # Compute projection size (adaptive or fixed)
+                if self.use_adaptive_proj_size and self.adaptive_proj_mode == "layer":
+                    # For layer mode, get layer params
+                    lkey = layer_key(name)
+                    layer_params = self._layer_groups.get(lkey, {name: tb})
+                    proj_dim = self._compute_proj_size(name, tb, layer_params)
+                else:
+                    proj_dim = self._compute_proj_size(name, tb)
+                
+                # Choose scoped dim & build (or reuse) operator
                 seed_key = proj_seed_key(name)
                 cur_D = global_D if (global_D is not None) else d_last
-                proj_dim = max(1, int(cur_D * self.proj_ratio))
                 cache_key = (seed_key, cur_D, proj_dim)
                 if cache_key not in op_cache:
                     fwd, lift = _fastfood_ops(

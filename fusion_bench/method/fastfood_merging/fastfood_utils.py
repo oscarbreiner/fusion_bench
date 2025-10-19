@@ -418,6 +418,347 @@ def ema_merge_subspace(
 
 
 # ============================================================================
+# Advanced Aggregation Functions (Preconditioning & Geometric Mixers)
+# ============================================================================
+
+@torch.no_grad()
+def energy_equalize(U: Tensor, eps: float = 1e-8) -> Tensor:
+    """
+    Energy Equalization (per-donor scaling).
+    Scales each donor row to have the median row-norm across donors.
+    Helps prevent a single large-magnitude donor from dominating.
+    
+    Args:
+        U: [K, M] stacked task vectors (K donors, M dimensions)
+        eps: Small constant for numerical stability
+        
+    Returns:
+        Energy-equalized tensor [K, M]
+    """
+    K, M = U.shape
+    norms = U.norm(dim=1) + eps          # [K]
+    target = norms.median()               # scalar
+    scale = (target / norms).view(K, 1)   # [K,1]
+    return U * scale
+
+
+@torch.no_grad()
+def variance_aware_weights(U: Tensor, eps: float = 1e-8) -> Tensor:
+    """
+    Variance-Aware Weighting (coordinate-wise).
+    Down-weights high-variance coordinates across donors (per column).
+    Returns weights w ∈ R^M to be applied elementwise post-aggregation: z *= w.
+    
+    Args:
+        U: [K, M] stacked task vectors
+        eps: Small constant for numerical stability
+        
+    Returns:
+        Weight vector [M] to apply elementwise
+    """
+    # sample variance across donors per coordinate
+    var = U.var(dim=0, unbiased=False)    # [M]
+    w = 1.0 / (var + eps)                 # inverse-variance
+    w = w / (w.mean() + eps)              # mild normalization
+    return w
+
+
+@torch.no_grad()
+def subspace_whiten(U: Tensor, eps: float = 1e-6) -> Tensor:
+    """
+    Subspace Whitening (donor-covariance).
+    Whiten along donor dimension: compute C = cov(U) over donors and apply C^{-1/2}.
+    Reduces correlated redundancy; improves conditioning before aggregation.
+    
+    Args:
+        U: [K, M] stacked task vectors
+        eps: Small constant for numerical stability
+        
+    Returns:
+        Whitened tensor [K, M]
+    """
+    K, M = U.shape
+    Uc = U - U.mean(dim=0, keepdim=True)        # center across donors
+    # donor covariance in donor space (KxK) via Gram factorization
+    G = (Uc @ Uc.t()) / max(M, 1)               # [K,K]
+    # stable inverse sqrt via eig (K is small)
+    eigvals, eigvecs = torch.linalg.eigh(G)     # ascending
+    inv_sqrt = (eigvals.clamp_min(eps)).rsqrt()
+    W = (eigvecs * inv_sqrt.unsqueeze(0)) @ eigvecs.t()  # G^{-1/2}
+    return W @ Uc    # whitened donors, still shape [K,M]
+
+
+@torch.no_grad()
+def conflict_gating(U: Tensor, tau: float = 0.6, eps: float = 1e-8) -> Tensor:
+    """
+    Conflict Gating (sign entropy mask).
+    For each coord j, compute sign distribution across donors; if entropy high, gate to 0.
+    tau is the threshold on |mean sign|; lower tau => more gating.
+    Returns a masked copy of U (same shape).
+    
+    Args:
+        U: [K, M] stacked task vectors
+        tau: Threshold on |mean sign| (default 0.6)
+        eps: Small constant for numerical stability
+        
+    Returns:
+        Gated tensor [K, M]
+    """
+    sgn = torch.sign(U)                                # {-1,0,+1}
+    mean_sign = sgn.sum(dim=0) / ( (sgn != 0).sum(dim=0).clamp_min(1) )  # [-1,1]
+    mask = (mean_sign.abs() >= tau).float()            # [M]
+    return U * mask.unsqueeze(0)
+
+
+@torch.no_grad()
+def elect_then_avg(U: Tensor) -> Tensor:
+    """
+    Two-stage 'Elect-then-Avg'.
+    (1) Elect dominant sign per coordinate by majority.
+    (2) Average only donors that match the elected sign at each coordinate.
+    
+    Args:
+        U: [K, M] stacked task vectors
+        
+    Returns:
+        Merged tensor [M]
+    """
+    sgn_sum = torch.sign(U).sum(dim=0)                 # [-K..K]
+    elected = torch.where(sgn_sum >= 0, 1.0, -1.0)     # ties -> +1
+    match = (torch.sign(U) == elected.unsqueeze(0))    # [K,M] boolean
+    denom = match.sum(dim=0).clamp_min(1).float()
+    return (U * match).sum(dim=0) / denom
+
+
+@torch.no_grad()
+def soft_signmax(U: Tensor, T: float = 0.25) -> Tensor:
+    """
+    Soft-SignMax (temperatured).
+    Per coordinate: pick dominant sign; among donors with that sign, softmax-weight by |u|/T.
+    Smooth version of sign-consistent argmax; T small => peakier.
+    
+    Args:
+        U: [K, M] stacked task vectors
+        T: Temperature parameter (default 0.25)
+        
+    Returns:
+        Merged tensor [M]
+    """
+    K, M = U.shape
+    sgn_sum = torch.sign(U).sum(dim=0)
+    elected = torch.where(sgn_sum >= 0, 1.0, -1.0)           # [M]
+    same = (torch.sign(U) == elected.unsqueeze(0))           # [K,M]
+    scores = U.abs() / max(T, 1e-6)                          # [K,M]
+    scores[~same] = -float('inf')                            # mask opposite sign
+    W = torch.softmax(scores, dim=0)                         # [K,M]
+    # handle all-masked columns (all -inf): softmax gives NaNs -> set to 0
+    W = torch.nan_to_num(W, nan=0.0, posinf=0.0, neginf=0.0)
+    return (W * U).sum(dim=0)                                # [M]
+
+
+@torch.no_grad()
+def align_weighted_mean(U: Tensor, gamma: float = 2.0, clip_neg: bool = True, eps: float = 1e-8) -> Tensor:
+    """
+    Alignment-Weighted Mean (AWM).
+    Weight donors by cosine similarity to the consensus center c = mean(U).
+    w_k ∝ max(0, cos(u_k, c))^gamma  (if clip_neg), else cos^gamma with clamp to eps.
+    
+    Args:
+        U: [K, M] stacked task vectors
+        gamma: Exponent for weighting (default 2.0)
+        clip_neg: Whether to clip negative cosines to 0 (default True)
+        eps: Small constant for numerical stability
+        
+    Returns:
+        Merged tensor [M]
+    """
+    K, M = U.shape
+    c = U.mean(dim=0)                                        # [M]
+    c_norm = c.norm() + eps
+    u_norms = U.norm(dim=1) + eps                            # [K]
+    cos = (U @ c) / (u_norms * c_norm)                       # [K]
+    if clip_neg:
+        cos = cos.clamp_min(0.0)
+    w = (cos.clamp_min(0.0)) ** gamma + eps                  # [K]
+    w = w / w.sum()
+    return (w.view(K, 1) * U).sum(dim=0)
+
+
+@torch.no_grad()
+def coherence_penalized_weights(U: Tensor, lam: float = 1e-3) -> Tensor:
+    """
+    Coherence-Penalized Weights (CPW).
+    Solve w ∝ (G + λI)^{-1} 1 where G = U U^T (Gram across donors),
+    then z = Σ_k w_k u_k. Penalizes redundant (highly coherent) donors.
+    
+    Args:
+        U: [K, M] stacked task vectors
+        lam: Regularization parameter (default 1e-3)
+        
+    Returns:
+        Merged tensor [M]
+    """
+    K, M = U.shape
+    G = U @ U.t()                                         # [K,K]
+    I = torch.eye(K, device=U.device, dtype=U.dtype)
+    b = torch.ones(K, 1, device=U.device, dtype=U.dtype)  # [K,1]
+    w = torch.linalg.solve(G + lam * I, b).squeeze(1)     # [K]
+    w = torch.clamp(w, min=0.0)
+    w = w / (w.sum() + 1e-8)
+    return (w.view(K, 1) * U).sum(dim=0)
+
+
+@torch.no_grad()
+def orthogonal_deflation_merge(U: Tensor, weight_by_residual: bool = True, eps: float = 1e-8) -> Tensor:
+    """
+    Orthogonal-Deflation Merge (ODM).
+    Add only 'new' information from each donor by sequentially removing
+    components already spanned by previous donors (Gram-Schmidt on rows).
+    z = Σ_k α_k * r_k, with r_k the residual of u_k against the span of {u_1..u_{k-1}}.
+    
+    Args:
+        U: [K, M] stacked task vectors
+        weight_by_residual: Whether to weight by residual norm (default True)
+        eps: Small constant for numerical stability
+        
+    Returns:
+        Merged tensor [M]
+    """
+    K, M = U.shape
+    Q = []    # orthonormal basis vectors in R^M
+    alphas = []
+    for k in range(K):
+        r = U[k]
+        # project out existing basis
+        for q in Q:
+            r = r - (r @ q) * q
+        nr = r.norm()
+        if nr > eps:
+            q = r / nr
+            Q.append(q)
+            alphas.append(nr if weight_by_residual else 1.0)
+    if not Q:
+        return torch.zeros(M, dtype=U.dtype, device=U.device)
+    A = torch.tensor(alphas, dtype=U.dtype, device=U.device).view(-1, 1)  # [L,1]
+    Qmat = torch.stack(Q, dim=0)                                          # [L,M]
+    return (A * Qmat).sum(dim=0)                                          # [M]
+
+
+# ============================================================================
+# Tuning-Free ODM-EMA (Orthogonal Deflation + Parameter-Free EMA)
+# ============================================================================
+
+@torch.no_grad()
+def _tf_svd_energy_basis(H: Tensor) -> Tensor | None:
+    """
+    Build an orthonormal basis Q spanning the top-energy subspace of H's columns.
+    Tuning-free choices baked in:
+      - energy threshold α = 0.5
+      - protected rank cap = 16
+    
+    Args:
+        H: [D, k] matrix whose columns are past residuals.
+    
+    Returns:
+        Q: [D, q] with q ≤ 16 (or None if H is empty / degenerate).
+    """
+    if H is None or H.numel() == 0 or H.shape[1] == 0:
+        return None
+    U, S, _ = torch.linalg.svd(H, full_matrices=False)  # H = U diag(S) V^T
+    if S.numel() == 0:
+        return None
+    e = S.pow(2)
+    tot = float(e.sum())
+    if tot <= 0.0:
+        return None
+    # α = 0.5 cumulative energy
+    cume = torch.cumsum(e, dim=0)
+    r = int(torch.searchsorted(cume, 0.5 * tot)) + 1
+    q = max(1, min(r, 16, U.shape[1]))  # cap rank at 16
+    return U[:, :q]
+
+
+@torch.no_grad()
+def _tf_odm_residual(z_new: Tensor, history: list[Tensor]) -> Tensor:
+    """
+    Project z_new onto the orthogonal complement of the protected span
+    defined by past residuals in 'history'.
+    
+    Args:
+        z_new:   [D] new vector
+        history: list of previous residuals (each [D])
+    
+    Returns:
+        r_t:     [D] orthogonal residual
+    """
+    if not history:
+        return z_new
+    H = torch.stack(history, dim=1)  # [D, k]
+    Q = _tf_svd_energy_basis(H)      # [D, q] or None
+    if Q is None:
+        return z_new
+    return z_new - Q @ (Q.T @ z_new)  # r_t = (I - QQ^T) z_new
+
+
+@torch.no_grad()
+def odm_ema_tuning_free(U: Tensor) -> Tensor:
+    """
+    Tuning-free ODM-EMA for subspace aggregation.
+    
+    Sequentially merges K task vectors U[k] by:
+      (1) Orthogonal-deflating each new vector against a protected subspace
+          spanned by past residuals (α=0.5 energy; rank cap=16).
+      (2) Parameter-free EMA smoothing with β_t = t/(t+1) to reduce order-sensitivity.
+      (3) √t norm control (λ(t)) via z_acc <- sqrt(t/(t+1)) * z_acc + 1/sqrt(t+1) * r_t.
+    
+    No hyperparameters exposed. A small residual history cap (32) is used
+    to keep the protected basis compact and stable.
+    
+    Args:
+        U: [K, ..., M] stacked task vectors in the SAME space (e.g., Fastfood subspace Y).
+    
+    Returns:
+        merged: [..., M] merged vector.
+    """
+    K = U.shape[0]
+    if K == 0:
+        raise ValueError("No task vectors to merge.")
+    if K == 1:
+        return U[0]
+    
+    orig_shape = U.shape[1:]
+    Z = U.reshape(K, -1).to(torch.float32)
+    D = Z.shape[1]
+    
+    z_acc = torch.zeros(D, dtype=Z.dtype, device=Z.device)
+    history: list[Tensor] = []  # store residuals r_t (orthogonal components)
+    
+    for t in range(K):
+        z_new = Z[t]
+        # ODM residual against protected span of past residuals
+        r_t = _tf_odm_residual(z_new, history)
+        
+        # Parameter-free EMA: beta_t = t / (t+1)
+        # Combine with √t norm control:
+        #   z_acc <- sqrt(t/(t+1)) * z_acc + 1/sqrt(t+1) * r_t
+        # This is equivalent to a conservative, tuning-free smoothing with bounded drift.
+        if t == 0:
+            z_acc = r_t
+        else:
+            w_old = math.sqrt(t / (t + 1.0))
+            w_new = 1.0 / math.sqrt(t + 1.0)
+            z_acc = w_old * z_acc + w_new * r_t
+        
+        # Update residual history (cap at 32)
+        if r_t.norm() > 1e-6:
+            history.append(r_t.detach().clone())
+            if len(history) > 32:
+                history.pop(0)
+    
+    return z_acc.reshape(orig_shape)
+
+
+# ============================================================================
 # Zero-Aware Aggregation Functions
 # ============================================================================
 
@@ -435,20 +776,48 @@ def zero_aware_aggregate(
     which is crucial for sparse or disentangled parameter merging.
     
     Supported merge functions:
-      - 'sum': Elementwise sum (weights optional)
-      - 'mean': Elementwise mean over *nonzero* contributors only
-      - 'max': Elementwise argmax by |u_k|; zeros preserved
-      - 'signmax': Per position, pick dominant sign, then largest |u_k| with that sign
-      - 'ema': Exponential Moving Average with adaptive β_t
-      - 'ties_sum': TIES merging with sum aggregation
-      - 'ties_mean': TIES merging with mean aggregation
-      - 'ties_max': TIES merging with max aggregation
+      Basic:
+        - 'sum': Elementwise sum (weights optional)
+        - 'mean': Elementwise mean over *nonzero* contributors only
+        - 'max': Elementwise argmax by |u_k|; zeros preserved
+        - 'signmax': Per position, pick dominant sign, then largest |u_k| with that sign
+      
+      Advanced:
+        - 'ema': Exponential Moving Average with adaptive β_t
+        - 'ties_sum': TIES merging with sum aggregation
+        - 'ties_mean': TIES merging with mean aggregation
+        - 'ties_max': TIES merging with max aggregation
+      
+      Preconditioning:
+        - 'energy_equalize': Scale donors to median norm, then mean
+        - 'variance_aware': Inverse-variance weighting of coordinates
+        - 'subspace_whiten': Donor-covariance whitening, then mean
+        - 'conflict_gating': Gate high-conflict coordinates, then mean
+      
+      Sign/Conflict Control:
+        - 'elect_then_avg': Elect dominant sign, average matching donors
+        - 'soft_signmax': Soft sign-consistent max with temperature
+      
+      Geometric Mixers:
+        - 'align_weighted_mean': Weight by cosine alignment to center
+        - 'coherence_penalized': Penalize redundant (coherent) donors
+        - 'orthogonal_deflation': Gram-Schmidt deflation merge
+      
+      Tuning-Free:
+        - 'odm_ema_tuning_free': ODM + parameter-free EMA (no hyperparameters)
     
     Args:
         U: [K, ..., M] stacked task vectors (K = number of tasks)
         merge_func: Aggregation function name
         weights: Optional task importance weights
-        **kwargs: Additional parameters (e.g., EMA parameters)
+        **kwargs: Additional parameters:
+            - EMA: ema_task_order, ema_gamma, ema_w_c, ema_w_s, ema_custom_order
+            - Conflict gating: conflict_tau (default 0.6)
+            - Soft signmax: soft_signmax_temperature (default 0.25)
+            - Align weighted mean: awm_gamma (default 2.0), awm_clip_neg (default True)
+            - Coherence penalized: cpw_lambda (default 1e-3)
+            - Orthogonal deflation: odm_weight_by_residual (default True)
+            - General: eps (default 1e-8 or 1e-6)
     
     Returns:
         Merged tensor
@@ -456,7 +825,16 @@ def zero_aware_aggregate(
     K = U.shape[0]
     mf = merge_func.lower()
     
-    valid_funcs = {"sum", "mean", "max", "signmax", "ema", "ties_sum", "ties_mean", "ties_max"}
+    valid_funcs = {
+        "sum", "mean", "max", "signmax", "ema", 
+        "ties_sum", "ties_mean", "ties_max",
+        # Advanced aggregation functions
+        "energy_equalize", "variance_aware", "subspace_whiten",
+        "conflict_gating", "elect_then_avg", "soft_signmax",
+        "align_weighted_mean", "coherence_penalized", "orthogonal_deflation",
+        # Tuning-free ODM-EMA
+        "odm_ema_tuning_free"
+    }
     if mf not in valid_funcs:
         raise ValueError(f"merge_func={merge_func} not in {valid_funcs}")
 
@@ -480,6 +858,10 @@ def zero_aware_aggregate(
             ties_merge_func=ties_func,
             weights=weights
         )
+
+    # Tuning-free ODM-EMA
+    if mf == "odm_ema_tuning_free":
+        return odm_ema_tuning_free(U)
 
     # Sum aggregation
     if mf == "sum":
@@ -541,6 +923,66 @@ def zero_aware_aggregate(
         if all_zero.any():
             out = out.masked_fill(all_zero, 0.0)
         return out
+
+    # Advanced aggregation functions
+    # These require flattening to 2D [K, M] for processing
+    orig_shape = U.shape[1:]
+    U_flat = U.view(K, -1)
+    
+    # Energy equalization (preprocessing + mean)
+    if mf == "energy_equalize":
+        U_eq = energy_equalize(U_flat, eps=kwargs.get("eps", 1e-8))
+        result = U_eq.mean(dim=0)
+        return result.view(orig_shape)
+    
+    # Variance-aware weighting (mean + reweighting)
+    if mf == "variance_aware":
+        var_weights = variance_aware_weights(U_flat, eps=kwargs.get("eps", 1e-8))
+        result = U_flat.mean(dim=0) * var_weights
+        return result.view(orig_shape)
+    
+    # Subspace whitening (preprocessing + mean)
+    if mf == "subspace_whiten":
+        U_white = subspace_whiten(U_flat, eps=kwargs.get("eps", 1e-6))
+        result = U_white.mean(dim=0)
+        return result.view(orig_shape)
+    
+    # Conflict gating (preprocessing + mean)
+    if mf == "conflict_gating":
+        tau = kwargs.get("conflict_tau", 0.6)
+        U_gated = conflict_gating(U_flat, tau=tau, eps=kwargs.get("eps", 1e-8))
+        result = U_gated.mean(dim=0)
+        return result.view(orig_shape)
+    
+    # Elect-then-avg
+    if mf == "elect_then_avg":
+        result = elect_then_avg(U_flat)
+        return result.view(orig_shape)
+    
+    # Soft-signmax
+    if mf == "soft_signmax":
+        T = kwargs.get("soft_signmax_temperature", 0.25)
+        result = soft_signmax(U_flat, T=T)
+        return result.view(orig_shape)
+    
+    # Alignment-weighted mean
+    if mf == "align_weighted_mean":
+        gamma = kwargs.get("awm_gamma", 2.0)
+        clip_neg = kwargs.get("awm_clip_neg", True)
+        result = align_weighted_mean(U_flat, gamma=gamma, clip_neg=clip_neg, eps=kwargs.get("eps", 1e-8))
+        return result.view(orig_shape)
+    
+    # Coherence-penalized weights
+    if mf == "coherence_penalized":
+        lam = kwargs.get("cpw_lambda", 1e-3)
+        result = coherence_penalized_weights(U_flat, lam=lam)
+        return result.view(orig_shape)
+    
+    # Orthogonal deflation merge
+    if mf == "orthogonal_deflation":
+        weight_by_residual = kwargs.get("odm_weight_by_residual", True)
+        result = orthogonal_deflation_merge(U_flat, weight_by_residual=weight_by_residual, eps=kwargs.get("eps", 1e-8))
+        return result.view(orig_shape)
 
 
 # ============================================================================

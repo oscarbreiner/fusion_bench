@@ -1,0 +1,7 @@
+_target_: fusion_bench.method.analysis.LinearWeightsSimilarityOriginal
+plot_heatmap: true
+trainable_only: true
+output_path: null
+method_name: "original_linear_weights"
+jaccard_threshold: 0.01  # Threshold for considering parameters "significant" in Jaccard similarity
+device: "cuda"

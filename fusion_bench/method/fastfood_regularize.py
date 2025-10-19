@@ -59,6 +59,7 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         device: str = "cuda",
         subspace_scope: str = "global",
         block_rows: int = 8192,
+        only_project_linear: bool = False,
         exclude_parameters: List[str] | None = None,
         **kwargs: Any,
     ):
@@ -68,12 +69,13 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self.device = torch.device(device)
         self.subspace_scope = str(subspace_scope)
         self.block_rows = int(block_rows)
+        self.only_project_linear = bool(only_project_linear)
         self.exclude_parameters = list(exclude_parameters) if exclude_parameters is not None else [
             "*norm*", "*bias*", "*pos_embed*", "*cls_token*", "patch_embed.*", 
             "*running_*", "*num_batches_tracked*"
         ]
         
-        log.info(f"FastFood Regularize initialized: proj_ratio={proj_ratio}, scope={subspace_scope}")
+        log.info(f"FastFood Regularize initialized: proj_ratio={proj_ratio}, scope={subspace_scope}, only_project_linear={self.only_project_linear}")
     
     def _should_exclude(self, param_name: str) -> bool:
         """Check if parameter should be excluded from projection."""
@@ -115,12 +117,21 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         dev = self.device
         
         # Identify eligible parameters
-        keys_float = [
-            k for k in state_dict.keys()
-            if torch.is_floating_point(state_dict[k])
-            and state_dict[k].ndim >= 1
-            and not self._should_exclude(k)
-        ]
+        if self.only_project_linear:
+            # Only project 2D (linear) tensors
+            keys_float = [
+                k for k in state_dict.keys()
+                if torch.is_floating_point(state_dict[k])
+                and state_dict[k].ndim == 2
+                and not self._should_exclude(k)
+            ]
+        else:
+            keys_float = [
+                k for k in state_dict.keys()
+                if torch.is_floating_point(state_dict[k])
+                and state_dict[k].ndim >= 1
+                and not self._should_exclude(k)
+            ]
         
         # Operator cache
         op_cache = {}

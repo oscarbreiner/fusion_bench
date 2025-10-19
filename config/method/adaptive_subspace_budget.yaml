@@ -1,0 +1,51 @@
+# ============================================================================
+# Adaptive Subspace Budget (Per-Tensor) Configuration
+# ============================================================================
+# Purpose:
+#   Estimate per-tensor effective rank along the projection axis (last dim)
+#   and produce suggested projection sizes m_t for Fastfood/SRHT merging.
+#
+# Method:
+#   For each parameter tensor W (ndim>=2), stack donor task deltas ΔW across
+#   tasks and rows, accumulate C = X^T X over blocks (X: [N_rows, d_last]),
+#   get eigenvalues λ of C, compute entropy effective rank from λ, then set:
+#       m_t = clamp( ceil(beta * r_eff), m_min, floor(m_max_frac * d_last) )
+#
+# Outputs:
+#   1) CSV with per-tensor metrics and suggested m_t
+#   2) JSON (and Torch file) mapping param_name -> suggested m_t
+#   3) Plots: histograms & scatter for (d_last vs r_eff / m_t)
+# ============================================================================
+
+_target_: fusion_bench.method.analysis.AdaptiveSubspaceBudgetAnalysis
+
+# Core
+trainable_only: true
+method_name: "adaptive_subspace_budget"
+device: "cuda"
+
+# Rank -> m mapping
+beta: 2.0           # multiplier on r_eff
+m_min: 16           # floor
+m_max_frac: 0.5     # cap as fraction of d_last (0..1]
+
+# Sampling / stability
+row_block: 8192     # block rows when accumulating C = X^T X
+max_rows_per_task: null   # optionally subsample rows per task tensor for speed; null = use all rows
+dtype: "float32"    # accumulation input dtype (C is computed in float64 internally)
+
+# Tensor filtering
+include_conv: false     # include Conv weights (reshape to [out, in*k*k])
+include_linear: true   # include Linear weights ([out, in])
+include_other_2d: false # include any 2D matrix that is not matched above
+include_1d: false      # skip 1D (bias / LN) by default
+
+# Plotting & saving
+save_csv: true
+save_json: true
+save_pt: true         # torch.save dict of suggested m
+create_plots: true
+output_path: null     # default: fabric logger dir
+
+# Safety / logging
+warn_on_empty: true

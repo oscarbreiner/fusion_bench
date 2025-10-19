@@ -1,0 +1,9 @@
+_target_: fusion_bench.method.analysis.LinearWeightsSimilarityIntrinsic
+plot_heatmap: true
+trainable_only: true
+output_path: null
+method_name: null  # Auto-generated based on proj_ratio and use_G
+jaccard_threshold: 0.01  # Threshold for considering parameters "significant" in Jaccard similarity
+proj_ratio: 0.75  # Projection ratio for Fastfood subspace (0.0 to 1.0)
+use_G: false      # Whether to use diagonal scaling matrix G in Fastfood transform
+device: "cuda"

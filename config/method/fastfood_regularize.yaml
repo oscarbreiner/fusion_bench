@@ -8,25 +8,24 @@ _target_: fusion_bench.method.fastfood_regularize.FastfoodRegularizeAlgorithm
 # ============================================================================
 # Core FastFood Parameters
 # ============================================================================
-proj_ratio: 0.5               # Subspace compression ratio (0.0-1.0)
+proj_ratio: 0.75              # Subspace compression ratio (0.0-1.0)
 use_G: false                  # Use Gaussian scaling in FastFood transform
 device: "cuda"                # Computation device
-block_rows: 8192              # Memory management for large tensors
-k_min: 64                     # Minimum projection dimension (protects tiny tensors)
+block_rows: 16384             # Memory management for large tensors
 
 # ============================================================================
 # Subspace Configuration
 # ============================================================================
-subspace_scope: "per_tensor"      # per_tensor | layer | global
+subspace_scope: "global"     # per_tensor | per_flat_tensor | layer | global
+                              # - per_tensor: row-wise projection (standard)
+                              # - per_flat_tensor: flatten 2D to (out*in), one projection
+                              # - layer: layer-wise shared projection
+                              # - global: single global projection for all params
 
 # ============================================================================
-# Parameter Selection
+# TSV-Style Linear/Non-Linear Separation
 # ============================================================================
-exclude_parameters:           # fnmatch patterns to exclude from projection
-  - "*norm*"                  # Layer normalization
-  - "*bias*"                  # All biases
-  - "*pos_embed*"             # Position embeddings
-  - "*cls_token*"             # CLS token
-  - "patch_embed.*"           # Patch embedding
-  - "*running_*"              # Batch norm running statistics
-  - "*num_batches_tracked*"   # Batch norm counters
+only_project_linear: true    # If true, only 2D tensors are projected; 1D tensors merged with mean in original space
+                              # This mimics TSV behavior: linear layers (weights) use subspace, non-linear (biases, norms) use mean
+
+# ============================================================================

@@ -1,66 +1,50 @@
 """
-FastFood Regularization Experiment
+FastFood Regularization Method
 
-This method tests the effect of Fastfood projection as a regularization technique
-by projecting individual task models (not merging them) and evaluating performance
-on their respective test datasets.
-
-The goal is to understand how lossy compression affects individual model performance
-before considering it for model merging scenarios.
+Evaluates individual task models with FastFood projection applied to task vectors.
+Similar to dummy method but applies FastFood projection on task deltas first.
 """
 
-from __future__ import annotations
 import logging
-from typing import Any, Dict, List
+import json
+from pathlib import Path
+from typing import Any, Dict, Tuple
+from copy import deepcopy
 
 import torch
-from torch import nn
+from torch import nn, Tensor
+import numpy as np
 
 from fusion_bench.method import BaseAlgorithm
-from fusion_bench.mixins import SimpleProfilerMixin, auto_register_config
+from fusion_bench.mixins import SimpleProfilerMixin
 from fusion_bench.modelpool import BaseModelPool
-from fusion_bench.compat.modelpool import to_modelpool
-from fusion_bench.utils import LazyStateDict
-
-# Import Fastfood utilities
 from fusion_bench.method.fastfood_merging.fastfood_utils import create_fastfood_ops
 
 log = logging.getLogger(__name__)
 
 
-@auto_register_config
 class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
-    """
-    FastFood Regularization: Project individual task models without merging.
-    
-    This method evaluates the effect of Fastfood projection as a form of
-    regularization by:
-    1. Loading each fine-tuned task model
-    2. Projecting parameters down to m dimensions and lifting back to D
-    3. Evaluating on the task's test dataset
-    4. Comparing with baseline (no projection)
-    
-    Parameters:
-        proj_ratio: Compression ratio (0.0-1.0), e.g., 0.5 = 50% compression
-        use_G: Use Gaussian scaling in Fastfood transform
-        device: Computation device (cuda/cpu)
-        subspace_scope: "per_tensor" | "layer" | "global"
-        block_rows: Memory management for large tensors
-        exclude_parameters: Patterns to exclude from projection (e.g., normalization layers)
-        
-    Returns:
-        A dictionary with results for each task model (original + projected)
-    """
-    
+    """FastFood Regularization via Task Vector Projection"""
+
+    _config_mapping = BaseAlgorithm._config_mapping | {
+        "proj_ratio": "proj_ratio",
+        "use_G": "use_G",
+        "device": "device",
+        "subspace_scope": "subspace_scope",
+        "block_rows": "block_rows",
+        "only_project_linear": "only_project_linear",
+        "energy_rescale": "energy_rescale",
+    }
+
     def __init__(
         self,
         proj_ratio: float = 0.5,
         use_G: bool = False,
         device: str = "cuda",
-        subspace_scope: str = "global",
+        subspace_scope: str = "per_tensor",
         block_rows: int = 8192,
-        only_project_linear: bool = False,
-        exclude_parameters: List[str] | None = None,
+        only_project_linear: bool = True,
+        energy_rescale: bool = True,
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
@@ -70,266 +54,195 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self.subspace_scope = str(subspace_scope)
         self.block_rows = int(block_rows)
         self.only_project_linear = bool(only_project_linear)
-        self.exclude_parameters = list(exclude_parameters) if exclude_parameters is not None else [
-            "*norm*", "*bias*", "*pos_embed*", "*cls_token*", "patch_embed.*", 
-            "*running_*", "*num_batches_tracked*"
-        ]
-        
-        log.info(f"FastFood Regularize initialized: proj_ratio={proj_ratio}, scope={subspace_scope}, only_project_linear={self.only_project_linear}")
-    
-    def _should_exclude(self, param_name: str) -> bool:
-        """Check if parameter should be excluded from projection."""
-        import fnmatch
-        for pattern in self.exclude_parameters:
-            if fnmatch.fnmatch(param_name, pattern):
-                return True
-        return False
-    
-    def _layer_key(self, name: str) -> str:
-        """Extract layer key for layer-scoped projection."""
-        parts = name.split(".")
-        if len(parts) >= 3:
-            return ".".join(parts[:3])
-        if len(parts) >= 2:
-            return ".".join(parts[:2])
-        return name
-    
-    @torch.no_grad()
-    def project_model(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Project model parameters down and up using Fastfood.
-        
-        Args:
-            state_dict: Model state dictionary
-            
-        Returns:
-            Projected state dictionary
-        """
-        log.info(f"Projecting model with proj_ratio={self.proj_ratio}")
-        
-        # Skip projection if proj_ratio >= 1.0 (baseline/identity)
-        if self.proj_ratio >= 1.0:
-            log.info("proj_ratio >= 1.0: Skipping projection (identity/baseline)")
-            return {k: v.detach().cpu().clone() for k, v in state_dict.items()}
-        
-        # Work on CPU copies
-        projected_sd = {}
-        dev = self.device
-        
-        # Identify eligible parameters
-        if self.only_project_linear:
-            # Only project 2D (linear) tensors
-            keys_float = [
-                k for k in state_dict.keys()
-                if torch.is_floating_point(state_dict[k])
-                and state_dict[k].ndim == 2
-                and not self._should_exclude(k)
-            ]
-        else:
-            keys_float = [
-                k for k in state_dict.keys()
-                if torch.is_floating_point(state_dict[k])
-                and state_dict[k].ndim >= 1
-                and not self._should_exclude(k)
-            ]
-        
-        # Operator cache
-        op_cache = {}
-        
-        # Projection statistics
-        total_params = 0
-        projected_params = 0
-        reconstruction_error = 0.0
-        reconstruction_norm = 0.0
-        
-        for k in state_dict.keys():
-            if k not in keys_float:
-                # Copy non-projected parameters as-is
-                projected_sd[k] = state_dict[k].detach().cpu().clone()
-                continue
-            
-            # Project this parameter
-            tb = state_dict[k].detach().cpu().clone()
-            d_last = int(tb.shape[-1])
-            rows = tb.numel() // d_last
-            
-            if rows <= 0:
-                projected_sd[k] = tb
-                continue
-            
-            original = tb.view(rows, d_last).float()
-            
-            # Determine projection dimension based on ACTUAL dimension (not padded)
-            seed_key = self._get_seed_key(k)
-            
-            # For per_tensor: use actual dimension d_last
-            # For layer/global: use max dimension in scope
-            if self.subspace_scope == "per_tensor":
-                cur_D = d_last
-            elif self.subspace_scope == "layer":
-                # For layer scope, we'd need to scan all params in the layer
-                # For now, use actual dimension (conservative approach)
-                cur_D = d_last
-            else:  # global
-                # For global scope, compute max dimension across all eligible params
-                if 'global_D' not in locals():
-                    global_D = max(state_dict[key].shape[-1] for key in keys_float)
-                    log.info(f"Global dimension: {global_D}")
-                cur_D = global_D
-            
-            # Projection size based on actual dimension (not padded to power of 2)
-            proj_dim = max(1, int(cur_D * self.proj_ratio))
-            
-            cache_key = (seed_key, cur_D, proj_dim)
-            
-            if cache_key not in op_cache:
-                fwd, lift = create_fastfood_ops(
-                    cur_D, proj_dim, seed_key=seed_key, device=dev, use_G=self.use_G
-                )
-                op_cache[cache_key] = (fwd, lift)
-            else:
-                fwd, lift = op_cache[cache_key]
-            
-            # Process in blocks
-            reconstructed = torch.zeros_like(original)
-            br = min(self.block_rows, rows)
-            cursor = 0
-            
-            while cursor < rows:
-                take = min(rows - cursor, br)
-                sl = original[cursor:cursor + take, :]
-                
-                # NO EXTERNAL PADDING - operator handles power-of-2 padding internally
-                # If using per_tensor scope, operator is sized for d_last
-                # If using global scope and d_last < cur_D, we need to pad to cur_D
-                if cur_D > d_last:
-                    # Only pad if we're using a shared operator sized for larger dimension
-                    sl_input = torch.nn.functional.pad(sl, (0, cur_D - d_last))
-                else:
-                    sl_input = sl
-                
-                # Project down and up
-                Y = fwd(sl_input.to(dev, non_blocking=True))
-                X_rec = lift(Y).to("cpu", non_blocking=True)
-                
-                # Extract only the original dimension (no need to slice if no external padding)
-                if cur_D > d_last:
-                    X_rec = X_rec[:, :d_last]
-                
-                reconstructed[cursor:cursor + take, :] = X_rec
-                cursor += take
-            
-            # Compute reconstruction error
-            diff = reconstructed - original
-            reconstruction_error += float(diff.pow(2).sum().item())
-            reconstruction_norm += float(original.pow(2).sum().item())
-            
-            # Store projected parameter
-            projected_sd[k] = reconstructed.view(tb.shape).to(tb.dtype)
-            
-            total_params += original.numel()
-            projected_params += 1
-        
-        # Report reconstruction error
-        if reconstruction_norm > 0:
-            rel_error = reconstruction_error / reconstruction_norm
-            log.info(f"Projection stats: {projected_params}/{len(state_dict)} parameters projected")
-            log.info(f"Reconstruction error: {rel_error:.6e} (relative)")
-            log.info(f"Total squared error: {reconstruction_error:.6e}")
-            log.info(f"Total norm: {reconstruction_norm:.6e}")
-        
-        return projected_sd
-    
+        self.energy_rescale = bool(energy_rescale)
+
+        log.info(
+            f"FastFood Regularize: proj_ratio={self.proj_ratio}, "
+            f"scope={self.subspace_scope}, only_linear={self.only_project_linear}"
+        )
+
     def _get_seed_key(self, param_name: str) -> str:
-        """Get seed key based on subspace scope."""
         if self.subspace_scope == "global":
             return "__GLOBAL__"
         elif self.subspace_scope == "layer":
-            return self._layer_key(param_name)
+            parts = param_name.split(".")
+            if len(parts) >= 3:
+                return ".".join(parts[:3])
+            elif len(parts) >= 2:
+                return ".".join(parts[:2])
+            return param_name
         else:
             return param_name
-    
+
+    def _should_project(self, param_name: str, tensor: Tensor) -> bool:
+        if not torch.is_floating_point(tensor):
+            return False
+        return tensor.ndim == 2 if self.only_project_linear else tensor.ndim >= 1
+
     @torch.no_grad()
-    def run(self, modelpool: BaseModelPool, **kwargs: Any) -> Dict[str, Any]:
+    def _project_matrix(
+        self, mat: Tensor, proj_dim: int, seed_key: str, op_cache: Dict
+    ) -> Tensor:
+        rows, D = mat.shape
+        cache_key = (seed_key, D, proj_dim)
+
+        if cache_key not in op_cache:
+            fwd, lift = create_fastfood_ops(
+                D, proj_dim, seed_key=seed_key, device=self.device, use_G=self.use_G
+            )
+            op_cache[cache_key] = (fwd, lift)
+        else:
+            fwd, lift = op_cache[cache_key]
+
+        out = torch.empty_like(mat)
+        block_size = min(self.block_rows, rows)
+
+        if self.energy_rescale:
+            src_norm_sq = float(mat.pow(2).sum().item())
+            recon_norm_sq = 0.0
+
+        cursor = 0
+        while cursor < rows:
+            end = min(cursor + block_size, rows)
+            block = mat[cursor:end, :]          # stays on self.device
+            compressed = fwd(block)
+            reconstructed = lift(compressed)
+            out[cursor:end, :] = reconstructed
+
+            if self.energy_rescale:
+                recon_norm_sq += float(reconstructed.pow(2).sum().item())
+
+            cursor = end
+
+        if self.energy_rescale and src_norm_sq > 0 and recon_norm_sq > 0:
+            scale = (src_norm_sq / recon_norm_sq) ** 0.5
+            out.mul_(scale)
+
+        return out
+
+    @torch.no_grad()
+    def _project_task_vector(
+        self, delta_sd: Dict[str, Tensor]
+    ) -> Tuple[Dict[str, Tensor], Dict[str, float]]:
         """
-        Run FastFood regularization experiment on each task model.
-        
-        Args:
-            modelpool: Model pool containing task models
-            
         Returns:
-            Dictionary with original and projected state dicts for each task
+          projected: dict[name->Tensor] projected (or passthrough) deltas ON self.device in fp32
+          errors: dict[name->float] ONLY for tensors that were actually projected
         """
-        modelpool = to_modelpool(modelpool)
-        
+        if self.proj_ratio >= 1.0:
+            # no projection -> no errors
+            return {k: v.detach().to(self.device, dtype=torch.float32) for k, v in delta_sd.items()}, {}
+
+        projected: Dict[str, Tensor] = {}
+        errors: Dict[str, float] = {}
+        op_cache: Dict = {}
+
+        for param_name, delta_tensor in delta_sd.items():
+            # keep computation on self.device and in fp32
+            delta = delta_tensor.detach().to(self.device, dtype=torch.float32)
+
+            if not self._should_project(param_name, delta):
+                projected[param_name] = delta
+                continue
+
+            D = int(delta.shape[-1])
+            num_rows = delta.numel() // D
+            if num_rows <= 0 or D <= 0:
+                projected[param_name] = delta
+                continue
+
+            mat = delta.view(num_rows, D)
+            proj_dim = max(1, int(D * self.proj_ratio))
+            seed_key = self._get_seed_key(param_name)
+
+            mat_reconstructed = self._project_matrix(mat, proj_dim, seed_key, op_cache)
+            projected[param_name] = mat_reconstructed.view_as(delta)
+
+            # errors only for projected tensors
+            err = torch.linalg.norm(mat - mat_reconstructed).item() / (torch.linalg.norm(mat).item() + 1e-12)
+            errors[param_name] = err
+
+        return projected, errors
+
+    @torch.no_grad()
+    def run(self, modelpool: BaseModelPool) -> nn.Module:
         log.info("=" * 80)
-        log.info("FastFood Regularization Experiment")
+        log.info("FastFood Regularization - Individual Task Evaluation (no merging)")
         log.info("=" * 80)
-        log.info(f"Configuration:")
-        log.info(f"  proj_ratio: {self.proj_ratio}")
-        log.info(f"  subspace_scope: {self.subspace_scope}")
-        log.info(f"  use_G: {self.use_G}")
-        log.info(f"  exclude_patterns: {self.exclude_parameters}")
-        log.info("=" * 80)
-        
-        # Load base model as template
-        with self.profile("loading base model"):
-            base_model = modelpool.load_model("_pretrained_")
-            log.info(f"Base model loaded: {type(base_model)}")
-        
-        # Get task names
-        task_names = list(modelpool.model_names)
-        log.info(f"Found {len(task_names)} task models: {task_names}")
-        
-        results = {}
-        
-        # Process each task model
+
+        if isinstance(modelpool, nn.Module):
+            return modelpool
+
+        base_model = modelpool.load_pretrained_or_first_model()
+        base_sd = base_model.state_dict()
+        task_names = [n for n in modelpool.model_names if n != "_pretrained_"]
+
+        log.info(f"Base model: {len(base_sd)} parameters")
+        log.info(f"Tasks: {task_names}")
+
+        all_metrics = {"proj_ratio": self.proj_ratio, "tasks": {}}
+        returned_model = None
+
         for task_name in task_names:
-            log.info(f"\n{'='*60}")
-            log.info(f"Processing task: {task_name}")
-            log.info(f"{'='*60}")
-            
-            with self.profile(f"loading {task_name}"):
-                task_model = modelpool.load_model(task_name)
-                task_sd = task_model.state_dict()
-            
-            # Project the model
-            with self.profile(f"projecting {task_name}"):
-                projected_sd = self.project_model(task_sd)
-            
-            # Create projected model by loading state dict
-            with self.profile(f"creating projected model {task_name}"):
-                if isinstance(task_model, nn.Module):
-                    # Clone the task model structure and load projected weights
-                    from copy import deepcopy
-                    projected_model = deepcopy(task_model)
-                    projected_model.load_state_dict(projected_sd, strict=False)
-                elif isinstance(base_model, LazyStateDict):
-                    projected_model = deepcopy(base_model.meta_module)
-                    projected_model = projected_model.to_empty(device=base_model._device)
-                    projected_model.load_state_dict(projected_sd, strict=False)
-                else:
-                    log.warning(f"Unknown model type: {type(base_model)}, using state dict directly")
-                    projected_model = projected_sd
-            
-            results[task_name] = {
-                "original_model": task_model,
-                "projected_model": projected_model,
-                "task_name": task_name
+            log.info(f"\nProcessing: {task_name}")
+
+            task_model = modelpool.load_model(task_name)
+            task_sd = task_model.state_dict()
+
+            # compute delta only when keys match and are floating
+            delta_sd = {
+                k: (task_sd[k] - base_sd[k])
+                for k in task_sd.keys() & base_sd.keys()
+                if torch.is_floating_point(task_sd[k]) and torch.is_floating_point(base_sd[k])
             }
-            
-            log.info(f"✓ Task {task_name} processed successfully")
-        
-        log.info(f"\n{'='*80}")
-        log.info(f"All {len(task_names)} task models processed")
-        log.info(f"{'='*80}")
-        
-        self.print_profile_summary()
-        
-        # Return the first projected model (for evaluation compatibility)
-        # In practice, the taskpool will evaluate each task separately
-        if results:
-            first_task = list(results.keys())[0]
-            return results[first_task]["projected_model"]
-        
-        return base_model
+
+            # project deltas
+            delta_proj_sd, recon_errors = self._project_task_vector(delta_sd)
+
+            # reconstruct state dict: base + projected_delta (cast to base dtype/device)
+            new_sd = {}
+            for k in base_sd.keys():
+                if k in delta_proj_sd:
+                    dp = delta_proj_sd[k].to(device=base_sd[k].device, dtype=base_sd[k].dtype)
+                    new_sd[k] = base_sd[k] + dp
+                elif k in task_sd:
+                    t = task_sd[k]
+                    if t.device != base_sd[k].device or t.dtype != base_sd[k].dtype:
+                        t = t.to(device=base_sd[k].device, dtype=base_sd[k].dtype)
+                    new_sd[k] = t
+                else:
+                    new_sd[k] = base_sd[k].clone()
+
+            reconstructed_model = deepcopy(base_model)
+            reconstructed_model.load_state_dict(new_sd, strict=True)
+            returned_model = reconstructed_model  # last one returned; metrics file holds all
+
+            # aggregate errors (only projected tensors)
+            layer_errors: Dict[str, list] = {}
+            for pname, err in recon_errors.items():
+                layer_key = self._get_seed_key(pname)
+                layer_errors.setdefault(layer_key, []).append(err)
+
+            avg_layer_errors = {layer: float(np.mean(vals)) for layer, vals in layer_errors.items()}
+            overall_avg_error = float(np.mean(list(recon_errors.values()))) if recon_errors else 0.0
+
+            all_metrics["tasks"][task_name] = {
+                "overall_avg_error": overall_avg_error,
+                "avg_layer_errors": avg_layer_errors,
+                "num_projected_params": len(recon_errors),
+            }
+
+            log.info(f"  projected_params={len(recon_errors)}  avg_recon_error={overall_avg_error:.6f}")
+
+        self._save_metrics(all_metrics)
+        return returned_model if returned_model is not None else base_model
+
+    def _save_metrics(self, metrics: Dict[str, Any]):
+        try:
+            import hydra
+            output_dir = Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
+            with open(output_dir / "reconstruction_metrics.json", "w") as f:
+                json.dump(metrics, f, indent=2)
+            log.info(f"Saved metrics to: {output_dir}/reconstruction_metrics.json")
+        except Exception as e:
+            log.warning(f"Could not save metrics: {e}")

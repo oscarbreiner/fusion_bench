@@ -1,0 +1,84 @@
+# ============================================================================
+# FastFood Subspace Merging with Adaptive Projection Sizing
+# Example configuration showing rank-based adaptive projection
+# ============================================================================
+
+_target_: fusion_bench.method.fastfood_merging.FastfoodSubspaceMergeAlgorithm
+
+# ============================================================================
+# Core FastFood Parameters
+# ============================================================================
+proj_ratio: 0.25              # Base ratio (used in fixed strategy or as fallback)
+use_G: false                  # Use Gaussian scaling in FastFood transform
+device: "cuda"                # Computation device
+block_rows: 16384             # Memory management for large tensors
+
+# ============================================================================
+# Adaptive Projection Size Estimation
+# ============================================================================
+use_adaptive_proj_size: true  # Enable adaptive projection sizing
+adaptive_proj_mode: "tensor"  # "tensor" | "layer" (scope for rank estimation)
+                              # - tensor: per-tensor stable rank (fast, no SVD)
+                              # - layer: per-layer effective rank (SVD-based, mirrors intrinsic dim analysis)
+adaptive_proj_strategy: "rank" # "fixed" | "random" | "rank"
+                              # - fixed: m = ratio * d_last
+                              # - random: m ~ U[m_min, f_max * d_last]
+                              # - rank: m = beta * estimated_rank
+adaptive_proj_m_min: 16       # Minimum projection size
+adaptive_proj_f_max: 0.5      # Maximum fraction of d_last (clipping)
+adaptive_proj_pow2: true      # Round to power-of-2 for efficiency
+adaptive_proj_pow2_mode: "ceil" # "ceil" | "floor" | "nearest"
+adaptive_proj_beta: 2.5       # For rank strategy: m = beta * rank
+                              # beta > 1 ensures oversampling beyond intrinsic dim
+adaptive_proj_seed: null      # Random seed for random strategy (null = use global)
+
+# ============================================================================
+# Subspace Configuration
+# ============================================================================
+subspace_scope: "global"      # per_tensor | per_flat_tensor | layer | global
+merge_where: "subspace"       # subspace | postlift
+
+# ============================================================================
+# Merging Strategy
+# ============================================================================
+merge_func: "signmax"         # sum | mean | max | signmax | ema | ties_sum | ties_mean | ties_max
+align_mode: "none"            # none | ties | tadrop
+
+# ============================================================================
+# EMA Parameters (Active when merge_func="ema")
+# ============================================================================
+ema_task_order: "custom"
+ema_gamma: 2.0
+ema_w_c: 0.8
+ema_w_s: 0.2
+ema_custom_order: 
+  - "SUN397"
+  - "Stanford-Cars" 
+  - "DTD"
+  - "GTSRB"
+  - "SVHN"
+  - "MNIST"
+  - "RESISC45"
+  - "EuroSAT"
+
+# ============================================================================
+# Advanced Options
+# ============================================================================
+use_weight_matching: false
+only_project_linear: false
+weights: null
+scale: 1.0
+
+# ============================================================================
+# Analysis Integration
+# ============================================================================
+run_analysis: false
+analysis_methods: []
+analysis_output_path: null
+
+# ============================================================================
+# Task Arithmetic Reconstruction mode
+# ============================================================================
+use_task_arithmetic_reconstruction: false
+task_arithmetic_scaling: 1.0
+report_reconstruction_error: false

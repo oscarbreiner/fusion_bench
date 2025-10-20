@@ -1,0 +1,2 @@
+# fusion_bench/config/method/return_first_model.yaml
+_target_: fusion_bench.method.return_first_model.ReturnFirstModelAlgorithm

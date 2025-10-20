@@ -9,23 +9,29 @@ _target_: fusion_bench.method.fastfood_regularize.FastfoodRegularizeAlgorithm
 # Core FastFood Parameters
 # ============================================================================
 proj_ratio: 0.75              # Subspace compression ratio (0.0-1.0)
+                              # e.g., 0.75 means m = 0.75 * D
 use_G: false                  # Use Gaussian scaling in FastFood transform
-device: "cuda"                # Computation device
-block_rows: 16384             # Memory management for large tensors
+device: "cuda"                # Computation device (cuda or cpu)
+block_rows: 16384              # Memory management: process matrices in blocks
 
 # ============================================================================
 # Subspace Configuration
 # ============================================================================
-subspace_scope: "global"     # per_tensor | per_flat_tensor | layer | global
-                              # - per_tensor: row-wise projection (standard)
-                              # - per_flat_tensor: flatten 2D to (out*in), one projection
-                              # - layer: layer-wise shared projection
+subspace_scope: "per_tensor"  # per_tensor | layer | global
+                              # - per_tensor: separate projection per parameter (recommended)
+                              # - layer: shared projection within layer
                               # - global: single global projection for all params
 
 # ============================================================================
-# TSV-Style Linear/Non-Linear Separation
+# Filtering Options
 # ============================================================================
-only_project_linear: true    # If true, only 2D tensors are projected; 1D tensors merged with mean in original space
-                              # This mimics TSV behavior: linear layers (weights) use subspace, non-linear (biases, norms) use mean
+only_project_linear: true     # If true, only project 2D weight matrices
+                              # If false, project all floating point tensors (1D+)
+
+# ============================================================================
+# Post-processing Options
+# ============================================================================
+energy_rescale: true          # Rescale reconstructed deltas to match original norm
+                              # Helps preserve magnitude after FastFood projection
 
 # ============================================================================

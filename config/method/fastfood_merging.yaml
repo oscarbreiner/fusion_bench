@@ -14,6 +14,12 @@ device: "cuda"                # Computation device
 block_rows: 16384             # Memory management for large tensors
 
 # ============================================================================
+# Transform Type
+# ============================================================================
+transform_type: "hadamard"   # Options: hadamard | dct | dht | dft
+# This parameter can be swept via --transform_types in the workflow/SLURM/CLI for fastfood_merging
+
+# ============================================================================
 # Adaptive Projection Size Estimation (Optional)
 # ============================================================================
 use_adaptive_proj_size: false # Enable adaptive projection size estimation

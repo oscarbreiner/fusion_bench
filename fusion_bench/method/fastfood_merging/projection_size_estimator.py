@@ -1,3 +1,4 @@
+# projection_size_estimator.py
 """
 Projection Size Estimator for Fastfood Subspace Merging
 

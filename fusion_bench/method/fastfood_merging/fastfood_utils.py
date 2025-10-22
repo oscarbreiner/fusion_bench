@@ -2,14 +2,18 @@
 Utility functions for FWHT/SRHT/DCT/DHT-based subspace projections
 and model-merge helpers (TIES/EMA/etc.).
 
-Exposes:
-- Orthonormal transforms: FWHT, DCT (II), DHT
-- Subsampled projections: SRHT (Hadamard), and analogous DCT/DHT projections
-- Forward/adjoint (lifting) with mathematically correct scaling
+Main API:
+- create_projection_ops(...): Build projection (fwd) and lifting (lift) operators
+- Supports transforms: FWHT, SRHT (Hadamard), DCT-II, DHT
+- Mathematically correct scaling for all transforms
+
+Additional utilities:
+- Orthonormal transforms: fwht_inplace_ortho, dct_ortho, dht_ortho
+- Aggregation functions: zero_aware_aggregate, ties_merge_subspace, ema_merge_subspace
+- Helper functions: layer_key, compute_global_dim, normalize_weights
 
 Legacy compatibility:
-- `create_fastfood_ops(...)` kept as a shim for older callers and configs.
-- Legacy transform aliases supported: {"hadamard","wht","fastfood"} → "srht".
+- Transform aliases with warnings: {"hadamard","wht","fastfood"} → "srht"
 """
 
 from __future__ import annotations
@@ -28,7 +32,6 @@ from torch import Tensor
 __all__ = [
     "EPS",
     "create_projection_ops",
-    "create_fastfood_ops",  # legacy shim
     "fwht_inplace_ortho",
     "dct_ortho",
     "idct_ortho",
@@ -134,37 +137,46 @@ def idht_ortho(x: Tensor) -> Tensor:
 # Transform factory and projection ops
 # ============================================================================
 
-TransformType = Literal["fwht", "srht", "dct", "dht"]
+TransformType = Literal["fwht", "srht", "dct", "dht", "none"]
 
-# Legacy transform aliases (kept for configs/backwards compat)
-_LEGACY_TRANSFORM_ALIASES = {
-    "hadamard": "srht",
-    "wht": "srht",
-    "fastfood": "srht",
-    # pass-through for canonical names
-    "srht": "srht",
-    "fwht": "fwht",
-    "dct": "dct",
-    "dht": "dht",
-}
-
-def _normalize_transform_type(t: str) -> TransformType:
+def _normalize_transform_type(t: str | None) -> TransformType | None:
+    """
+    Normalize transform type string, supporting legacy names with warnings.
+    
+    Canonical names: "fwht" | "srht" | "dct" | "dht" | "none" | None
+    - "none" or None: Skip projection, merge directly in original space
+    Legacy aliases: "hadamard", "wht", "fastfood" → "srht"
+    """
+    # Handle None or "none" - no transformation
+    if t is None or (isinstance(t, str) and t.strip().lower() in {"none", "null", ""}):
+        return None
+    
     t_norm = t.strip().lower()
-    if t_norm not in _LEGACY_TRANSFORM_ALIASES:
-        raise ValueError(
-            f"Unknown transform_type='{t}'. Allowed: "
-            f"fwht | srht | dct | dht (legacy: hadamard/wht/fastfood→srht)"
-        )
-    canon = _LEGACY_TRANSFORM_ALIASES[t_norm]
-    # warn on legacy names, but only once per process
-    if t_norm in {"hadamard", "wht", "fastfood"}:
+    
+    # Legacy name mapping with warnings
+    legacy_map = {
+        "hadamard": "srht",
+        "wht": "srht",
+        "fastfood": "srht",
+    }
+    
+    if t_norm in legacy_map:
+        canon = legacy_map[t_norm]
         warnings.warn(
             f"transform_type='{t}' is deprecated; using '{canon}'. "
-            "Please update your configs to one of: fwht | srht | dct | dht.",
+            "Please update your configs to one of: fwht | srht | dct | dht | none.",
             category=UserWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
-    return canon  # type: ignore[return-value]
+        return canon  # type: ignore[return-value]
+    
+    # Validate canonical names
+    if t_norm not in {"fwht", "srht", "dct", "dht", "none"}:
+        raise ValueError(
+            f"Unknown transform_type='{t}'. Allowed: fwht | srht | dct | dht | none (or None)"
+        )
+    
+    return t_norm if t_norm != "none" else None  # type: ignore[return-value]
 
 class OrthoTransform:
     """
@@ -209,7 +221,7 @@ def create_projection_ops(
     global_dim: int,
     proj_dim: int,
     *,
-    transform_type: str,   # accepts canonical or legacy names
+    transform_type: str | None,   # accepts canonical or legacy names, or None for no transform
     seed_key: str,
     device: torch.device,
 ) -> Tuple[Callable[[Tensor], Tensor], Callable[[Tensor], Tensor]]:
@@ -217,6 +229,8 @@ def create_projection_ops(
     Build projection (fwd) and adjoint lifting (lift) operators.
 
     Modes:
+      - None/"none": No transformation - identity operators (merge in original space).
+                     y = x,    lift(y) = y  (no projection, no lifting)
       - "fwht": Full orthonormal transform (no subsampling). Requires proj_dim == L.
                 y = F (D ⊙ x),    lift(y) = D ⊙ F^{-1}(y)
       - "srht": Subsampled Hadamard sketch (Hadamard + sign flips + row sampling).
@@ -226,8 +240,8 @@ def create_projection_ops(
 
     Args:
         global_dim: Original input dimension D.
-        proj_dim:   Target projection dimension m (for fwht, must equal L).
-        transform_type: "fwht" | "srht" | "dct" | "dht" (legacy aliases accepted).
+        proj_dim:   Target projection dimension m (for fwht, must equal L; ignored for None).
+        transform_type: "fwht" | "srht" | "dct" | "dht" | "none" | None (legacy aliases accepted).
         seed_key:    Deterministic seed key for reproducibility.
         device:      torch.device for created tensors.
 
@@ -235,6 +249,20 @@ def create_projection_ops(
         (fwd, lift) callables.
     """
     kind = _normalize_transform_type(transform_type)
+    
+    # Handle None transform type - identity operators (no projection)
+    if kind is None:
+        @torch.no_grad()
+        def identity_fwd(x: Tensor) -> Tensor:
+            """Identity forward: no transformation, returns input as-is."""
+            return x.contiguous()
+        
+        @torch.no_grad()
+        def identity_lift(y: Tensor) -> Tensor:
+            """Identity lift: no transformation, returns input as-is."""
+            return y.contiguous()
+        
+        return identity_fwd, identity_lift
     torch.manual_seed(seed_from_string(seed_key))
     D = int(global_dim)
     tfm = OrthoTransform(kind, D, device)
@@ -281,49 +309,6 @@ def create_projection_ops(
         return y_full[..., :D].contiguous()
 
     return fwd, lift
-
-# ----------------------------------------------------------------------------
-# Legacy shim: create_fastfood_ops(...)
-# ----------------------------------------------------------------------------
-
-_warned_use_G = False  # ensure we warn only once
-
-@torch.no_grad()
-def create_fastfood_ops(
-    global_dim: int,
-    proj_dim: int,
-    *,
-    seed_key: str,
-    device: torch.device,
-    use_G: bool = False,           # ignored; kept for legacy config compatibility
-    transform_type: str = "hadamard",  # legacy default; maps to "srht"
-) -> Tuple[Callable[[Tensor], Tensor], Callable[[Tensor], Tensor]]:
-    """
-    Legacy entry point kept for older codepaths/configs.
-
-    Differences from historical behavior:
-      - `use_G` is ignored (Gaussian scaling is not used in our orthonormal designs).
-      - `transform_type` accepts legacy names; "hadamard"/"wht"/"fastfood" → "srht".
-    """
-    global _warned_use_G
-    if use_G and not _warned_use_G:
-        warnings.warn(
-            "create_fastfood_ops(...): `use_G=True` is deprecated and ignored. "
-            "The projection uses purely orthonormal transforms with sign flips.",
-            category=UserWarning,
-            stacklevel=2,
-        )
-        _warned_use_G = True
-
-    # Normalize legacy transform names and delegate
-    kind = _normalize_transform_type(transform_type)
-    return create_projection_ops(
-        global_dim,
-        proj_dim,
-        transform_type=kind,
-        seed_key=seed_key,
-        device=device,
-    )
 
 # ============================================================================
 # TIES / EMA / Advanced aggregation (unchanged)

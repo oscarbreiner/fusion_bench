@@ -17,7 +17,12 @@ scale_weights: null                   # Optional weights for different scales [w
 # ============================================================================
 # Core FastFood Parameters  
 # ============================================================================
-use_G: false                          # Use Gaussian scaling in FastFood transform
+transform_type: "srht"                # Transform type: "fwht" | "srht" | "dct" | "dht" | "none" | null
+                                      # - srht: Subsampled Hadamard (default, recommended)
+                                      # - fwht: Full Hadamard (no subsampling)
+                                      # - dct: Discrete Cosine Transform
+                                      # - dht: Discrete Hartley Transform
+                                      # - none/null: No projection, merge in original space (baseline)
 device: "cuda"                        # Computation device
 block_rows: 8192                      # Memory management for large tensors
 

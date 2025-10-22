@@ -27,7 +27,8 @@ from fusion_bench.mixins.lightning_fabric import LightningFabricMixin
 from fusion_bench.mixins.simple_profiler import SimpleProfilerMixin
 
 # we import only utils that don't affect differentiability paths
-from .fastfood_utils import layer_key, seed_from_string, next_pow2
+from .fastfood_utils import layer_key, seed_from_string
+from .structured_projection import next_pow2, fwht_inplace_ortho
 
 log = logging.getLogger(__name__)
 
@@ -38,20 +39,13 @@ def _fwht_ortho(x: Tensor) -> Tensor:
     """
     Differentiable orthonormal FWHT along last dim.
     Returns a new tensor (avoids unsafe in-place on autograd graph).
+    Uses the refactored structured_projection implementation.
     """
     n = x.shape[-1]
     if n <= 1:
         return x
-    y = x
-    h = 1
-    while h < n:
-        # shape (..., n//(2h), 2, h)
-        yv = y.view(*y.shape[:-1], -1, 2, h)
-        a = yv[..., 0, :]
-        b = yv[..., 1, :]
-        y = torch.cat([a + b, a - b], dim=-2).reshape(*y.shape[:-1], n)
-        h *= 2
-    return y * (1.0 / math.sqrt(n))
+    y = x.clone()  # ensure we don't modify input on autograd graph
+    return fwht_inplace_ortho(y)
 
 
 class _FFParams(nn.Module):

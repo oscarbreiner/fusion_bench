@@ -16,17 +16,12 @@ from fusion_bench.utils.type import StateDictType
 # Import utilities from fastfood_utils
 from .fastfood_utils import (
     EPS,
-    create_fastfood_ops,
+    create_projection_ops,
     zero_aware_aggregate,
     layer_key,
     normalize_weights,
     compute_global_dim
 )
-
-# Keep backward compatibility by re-exporting under old names
-_fastfood_ops = create_fastfood_ops
-_zero_aware_aggregate = zero_aware_aggregate
-_layer_key = layer_key
 
 
 # ------------------ Algorithm ------------------
@@ -50,9 +45,10 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
       feature_proj_ratio: float (projection ratio for feature extractor layers)
       rest_proj_ratio: float (projection ratio for remaining layers)
       
+      transform_type: str | None ("fwht" | "srht" | "dct" | "dht" | "none" | None)
+                      - None/"none": Skip projection, merge in original space
       merge_where:    "subspace" | "postlift"
       merge_func:     "sum" | "mean" | "max" | "signmax" | "ema" | "ties_sum" | "ties_mean" | "ties_max"
-      use_G:          bool
       block_rows:     int
       weights:        list[float] (donor weights; normalized internally)
       scale:          float (post-merge scale on Δ*)
@@ -68,8 +64,9 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
     def __init__(
         self,
         proj_ratio: float = 0.10,
-        use_G: bool = False,
+        use_G: bool = False,  # Deprecated, kept for config compatibility
         device: str = "cuda",
+        transform_type: str | None = "srht",    # "fwht" | "srht" | "dct" | "dht" | "none" | None
         layer_proj_mode: str = "inverse",  # "custom" | "inverse" | "forward" | "feature_split"
         layer_projections: Dict[str, float] | None = None,  # for custom mode
         # For feature_split mode:
@@ -99,7 +96,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
     ):
         super().__init__(**kwargs)
         self.proj_ratio = float(proj_ratio)
-        self.use_G = bool(use_G)
+        self.transform_type = str(transform_type)
         self.device = torch.device(device)
         
         # Layer-wise projection configuration
@@ -349,8 +346,11 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 
                 cache_key = (seed_key, cur_D, proj_dim)
                 if cache_key not in op_cache:
-                    fwd, lift = _fastfood_ops(
-                        cur_D, proj_dim, seed_key=seed_key, device=dev, use_G=self.use_G
+                    fwd, lift = create_projection_ops(
+                        cur_D, proj_dim, 
+                        transform_type=self.transform_type,
+                        seed_key=seed_key, 
+                        device=dev
                     )
                     op_cache[cache_key] = (fwd, lift)
                 else:
@@ -591,7 +591,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             analyzer = MergedTaskVectorAnalysis(
                 merging_methods=["fastfood_merging"],
                 proj_ratio=self.proj_ratio,
-                use_G=self.use_G,
+                transform_type=self.transform_type,
                 merge_func=self.merge_func,
                 subspace_scope="layer",  # Always layer scope for layerwise implementation
                 merge_where=self.merge_where,
@@ -617,7 +617,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 trainable_only=True,
                 method_name=method_id,
                 proj_ratio=self.proj_ratio,
-                use_G=self.use_G,
+                transform_type=self.transform_type,
                 analyze_subspace=True,
                 device=str(self.device),
                 output_path=self.analysis_output_path

@@ -10,7 +10,8 @@ _target_: fusion_bench.method.fastfood_regularize.FastfoodRegularizeAlgorithm
 # ============================================================================
 proj_ratio: 0.75              # Subspace compression ratio (0.0-1.0)
                               # e.g., 0.75 means m = 0.75 * D
-use_G: false                  # Use Gaussian scaling in FastFood transform
+transform_type: "srht"        # Transform type: "fwht" | "srht" | "dct" | "dht" | "none" | null
+                              # Use "none" or null to skip projection entirely (baseline)
 device: "cuda"                # Computation device (cuda or cpu)
 block_rows: 16384              # Memory management: process matrices in blocks
 
@@ -31,7 +32,6 @@ only_project_linear: true     # If true, only project 2D weight matrices
 # ============================================================================
 # Post-processing Options
 # ============================================================================
-energy_rescale: true          # Rescale reconstructed deltas to match original norm
-                              # Helps preserve magnitude after FastFood projection
+# energy_rescale removed - projection operators are assumed to be unitary
 
 # ============================================================================

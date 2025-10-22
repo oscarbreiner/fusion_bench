@@ -16,7 +16,12 @@ block_rows: 16384             # Memory management for large tensors
 # ============================================================================
 # Transform Type
 # ============================================================================
-transform_type: "hadamard"   # Options: hadamard | dct | dht | dft
+transform_type: "srht"       # Options: srht | fwht | dct | dht | none
+                              # - srht: Subsampled Hadamard (default, recommended)
+                              # - fwht: Full Hadamard (no subsampling)
+                              # - dct: Discrete Cosine Transform
+                              # - dht: Discrete Hartley Transform
+                              # - none (or null): No projection, merge in original space (baseline)
 # This parameter can be swept via --transform_types in the workflow/SLURM/CLI for fastfood_merging
 
 # ============================================================================

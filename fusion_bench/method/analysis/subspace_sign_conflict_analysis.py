@@ -43,16 +43,10 @@ from fusion_bench.modelpool import BaseModelPool
 from fusion_bench.utils.type import StateDictType
 
 # Import FastFood utilities
-try:
-    from fusion_bench.method.fastfood_merging.fastfood_utils import (
-        create_fastfood_ops,
-        layer_key,
-    )
-except ImportError:
-    from fusion_bench.method.fastfood_merging.fastfood_merging import (
-        _fastfood_ops as create_fastfood_ops,
-        _layer_key as layer_key,
-    )
+from fusion_bench.method.fastfood_merging.fastfood_utils import (
+    create_projection_ops,
+    layer_key,
+)
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +65,8 @@ class SubspaceSignConflictAnalysis(SimpleProfilerMixin, BaseAlgorithm):
     def __init__(
         self,
         proj_ratios: List[float] = [0.1, 0.25, 0.5, 0.75, 0.95],
-        use_G: bool = True,
+        use_G: bool = True,  # Deprecated, kept for config compatibility
+        transform_type: str | None = "srht",    # "fwht" | "srht" | "dct" | "dht" | "none" | None
         subspace_scope: str = "global",
         device: str = "cuda",
         output_path: str = "./sign_conflict_analysis",
@@ -84,7 +79,7 @@ class SubspaceSignConflictAnalysis(SimpleProfilerMixin, BaseAlgorithm):
         
         Args:
             proj_ratios: List of projection ratios to analyze
-            use_G: Whether to use Gaussian scaling in FastFood
+            transform_type: Transform type ("fwht" | "srht" | "dct" | "dht")
             subspace_scope: "global", "layer", or "per_tensor"
             device: Compute device
             output_path: Directory to save analysis results
@@ -93,7 +88,7 @@ class SubspaceSignConflictAnalysis(SimpleProfilerMixin, BaseAlgorithm):
         """
         super().__init__(**kwargs)
         self.proj_ratios = proj_ratios
-        self.use_G = use_G
+        self.transform_type = transform_type
         self.subspace_scope = subspace_scope
         self.device = torch.device(device)
         self.output_path = Path(output_path)
@@ -282,12 +277,12 @@ class SubspaceSignConflictAnalysis(SimpleProfilerMixin, BaseAlgorithm):
         cur_D = global_D if global_D is not None else d_last
         proj_dim = max(1, int(cur_D * proj_ratio))
         
-        fwd, lift = create_fastfood_ops(
+        fwd, lift = create_projection_ops(
             global_dim=cur_D,
             proj_dim=proj_dim,
+            transform_type=self.transform_type,
             seed_key=seed_key,
             device=self.device,
-            use_G=self.use_G,
         )
         
         # Project to subspace

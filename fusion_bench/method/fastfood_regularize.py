@@ -18,7 +18,7 @@ import numpy as np
 from fusion_bench.method import BaseAlgorithm
 from fusion_bench.mixins import SimpleProfilerMixin
 from fusion_bench.modelpool import BaseModelPool
-from fusion_bench.method.fastfood_merging.fastfood_utils import create_fastfood_ops
+from fusion_bench.method.fastfood_merging.fastfood_utils import create_projection_ops
 
 log = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
     _config_mapping = BaseAlgorithm._config_mapping | {
         "proj_ratio": "proj_ratio",
-        "use_G": "use_G",
+        "transform_type": "transform_type",
         "device": "device",
         "subspace_scope": "subspace_scope",
         "block_rows": "block_rows",
@@ -39,22 +39,23 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
     def __init__(
         self,
         proj_ratio: float = 0.5,
-        use_G: bool = False,
+        use_G: bool = False,  # Deprecated, kept for config compatibility
         device: str = "cuda",
+        transform_type: str | None = "srht",    # "fwht" | "srht" | "dct" | "dht" | "none" | None
         subspace_scope: str = "per_tensor",
         block_rows: int = 8192,
         only_project_linear: bool = True,
-        energy_rescale: bool = True,
+        energy_rescale: bool = False,  # Deprecated, kept for config compatibility
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self.proj_ratio = float(proj_ratio)
-        self.use_G = bool(use_G)
+        self.transform_type = str(transform_type)
         self.device = torch.device(device)
         self.subspace_scope = str(subspace_scope)
         self.block_rows = int(block_rows)
         self.only_project_linear = bool(only_project_linear)
-        self.energy_rescale = bool(energy_rescale)
+        # Energy rescaling removed - projection ops are assumed unitary
 
         log.info(
             f"FastFood Regularize: proj_ratio={self.proj_ratio}, "
@@ -87,8 +88,11 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         cache_key = (seed_key, D, proj_dim)
 
         if cache_key not in op_cache:
-            fwd, lift = create_fastfood_ops(
-                D, proj_dim, seed_key=seed_key, device=self.device, use_G=self.use_G
+            fwd, lift = create_projection_ops(
+                D, proj_dim, 
+                transform_type=self.transform_type,
+                seed_key=seed_key, 
+                device=self.device
             )
             op_cache[cache_key] = (fwd, lift)
         else:
@@ -97,10 +101,6 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         out = torch.empty_like(mat)
         block_size = min(self.block_rows, rows)
 
-        if self.energy_rescale:
-            src_norm_sq = float(mat.pow(2).sum().item())
-            recon_norm_sq = 0.0
-
         cursor = 0
         while cursor < rows:
             end = min(cursor + block_size, rows)
@@ -108,33 +108,27 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             compressed = fwd(block)
             reconstructed = lift(compressed)
             out[cursor:end, :] = reconstructed
-
-            if self.energy_rescale:
-                recon_norm_sq += float(reconstructed.pow(2).sum().item())
-
             cursor = end
-
-        if self.energy_rescale and src_norm_sq > 0 and recon_norm_sq > 0:
-            scale = (src_norm_sq / recon_norm_sq) ** 0.5
-            out.mul_(scale)
 
         return out
 
     @torch.no_grad()
     def _project_task_vector(
         self, delta_sd: Dict[str, Tensor]
-    ) -> Tuple[Dict[str, Tensor], Dict[str, float]]:
+    ) -> Tuple[Dict[str, Tensor], Dict[str, float], Dict[str, float]]:
         """
         Returns:
           projected: dict[name->Tensor] projected (or passthrough) deltas ON self.device in fp32
-          errors: dict[name->float] ONLY for tensors that were actually projected
+          errors: dict[name->float] relative reconstruction error (L2 norm ratio) for projected tensors
+          snr_db: dict[name->float] SNR in dB for projected tensors
         """
         if self.proj_ratio >= 1.0:
             # no projection -> no errors
-            return {k: v.detach().to(self.device, dtype=torch.float32) for k, v in delta_sd.items()}, {}
+            return {k: v.detach().to(self.device, dtype=torch.float32) for k, v in delta_sd.items()}, {}, {}
 
         projected: Dict[str, Tensor] = {}
         errors: Dict[str, float] = {}
+        snr_db: Dict[str, float] = {}
         op_cache: Dict = {}
 
         for param_name, delta_tensor in delta_sd.items():
@@ -158,11 +152,27 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             mat_reconstructed = self._project_matrix(mat, proj_dim, seed_key, op_cache)
             projected[param_name] = mat_reconstructed.view_as(delta)
 
-            # errors only for projected tensors
-            err = torch.linalg.norm(mat - mat_reconstructed).item() / (torch.linalg.norm(mat).item() + 1e-12)
-            errors[param_name] = err
+            # Calculate reconstruction error and SNR
+            original_norm = torch.linalg.norm(mat).item()
+            
+            if original_norm == 0.0:
+                # Zero tensor edge case - no meaningful error
+                errors[param_name] = 0.0
+                snr_db[param_name] = float('inf')  # Perfect reconstruction of zero
+            else:
+                noise = mat - mat_reconstructed
+                noise_norm = torch.linalg.norm(noise).item()
+                
+                # Relative error
+                errors[param_name] = noise_norm / original_norm
+                
+                # SNR in dB: 20 * log10(signal_norm / noise_norm)
+                if noise_norm == 0.0:
+                    snr_db[param_name] = float('inf')  # Perfect reconstruction
+                else:
+                    snr_db[param_name] = 20.0 * np.log10(original_norm / noise_norm)
 
-        return projected, errors
+        return projected, errors, snr_db
 
     @torch.no_grad()
     def run(self, modelpool: BaseModelPool) -> nn.Module:
@@ -197,7 +207,7 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             }
 
             # project deltas
-            delta_proj_sd, recon_errors = self._project_task_vector(delta_sd)
+            delta_proj_sd, recon_errors, snr_values = self._project_task_vector(delta_sd)
 
             # reconstruct state dict: base + projected_delta (cast to base dtype/device)
             new_sd = {}
@@ -219,20 +229,30 @@ class FastfoodRegularizeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
             # aggregate errors (only projected tensors)
             layer_errors: Dict[str, list] = {}
+            layer_snrs: Dict[str, list] = {}
             for pname, err in recon_errors.items():
                 layer_key = self._get_seed_key(pname)
                 layer_errors.setdefault(layer_key, []).append(err)
+                if pname in snr_values:
+                    layer_snrs.setdefault(layer_key, []).append(snr_values[pname])
 
             avg_layer_errors = {layer: float(np.mean(vals)) for layer, vals in layer_errors.items()}
+            avg_layer_snrs = {layer: float(np.mean(vals)) for layer, vals in layer_snrs.items()}
+            
             overall_avg_error = float(np.mean(list(recon_errors.values()))) if recon_errors else 0.0
+            # Filter out inf values for SNR averaging
+            finite_snrs = [v for v in snr_values.values() if not np.isinf(v)]
+            overall_avg_snr_db = float(np.mean(finite_snrs)) if finite_snrs else float('inf')
 
             all_metrics["tasks"][task_name] = {
                 "overall_avg_error": overall_avg_error,
+                "overall_avg_snr_db": overall_avg_snr_db,
                 "avg_layer_errors": avg_layer_errors,
+                "avg_layer_snrs_db": avg_layer_snrs,
                 "num_projected_params": len(recon_errors),
             }
 
-            log.info(f"  projected_params={len(recon_errors)}  avg_recon_error={overall_avg_error:.6f}")
+            log.info(f"  projected_params={len(recon_errors)}  avg_recon_error={overall_avg_error:.6f}  avg_snr={overall_avg_snr_db:.2f} dB")
 
         self._save_metrics(all_metrics)
         return returned_model if returned_model is not None else base_model

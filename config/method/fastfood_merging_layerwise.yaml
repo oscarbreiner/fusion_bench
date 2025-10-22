@@ -9,7 +9,8 @@ _target_: fusion_bench.method.fastfood_merging.fastfood_merging_layerwise.Fastfo
 # Core FastFood Parameters
 # ============================================================================
 proj_ratio: 0.10              # Base/default projection ratio (0.0-1.0)
-use_G: false                  # Use Gaussian scaling in FastFood transform
+transform_type: "srht"        # Transform type: "fwht" | "srht" | "dct" | "dht" | "none" | null
+                              # Use "none" or null to merge in original space without projection
 device: "cuda"                # Computation device
 block_rows: 8192              # Memory management for large tensors
 

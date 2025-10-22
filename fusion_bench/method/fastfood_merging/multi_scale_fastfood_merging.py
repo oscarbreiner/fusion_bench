@@ -15,15 +15,10 @@ from fusion_bench.utils.type import StateDictType
 # Import utilities from fastfood_utils
 from .fastfood_utils import (
     EPS,
-    create_fastfood_ops,
+    create_projection_ops,
     zero_aware_aggregate,
     layer_key,
 )
-
-# Keep backward compatibility
-_fastfood_ops = create_fastfood_ops
-_zero_aware_aggregate = zero_aware_aggregate
-_layer_key = layer_key
 
 
 @torch.no_grad()
@@ -96,8 +91,9 @@ class MultiScaleFastfoodMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
       proj_dims: List of projection dimensions (or ratios if < 1.0)
       subspace_func: Aggregation function within each subspace
       postlift_func: Aggregation function across post-lift results  
+      transform_type: str | None ("fwht" | "srht" | "dct" | "dht" | "none" | None)
+                      - None/"none": Skip projection, merge in original space
       subspace_scope: "per_tensor" | "layer" | "global"
-      use_G: bool (FastFood Gaussian scaling)
       block_rows: int (memory management)
       weights: Optional task importance weights
       scale_weights: Optional weights for different projection scales
@@ -111,8 +107,9 @@ class MultiScaleFastfoodMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         proj_dims: List[float] = [0.25, 0.50, 0.75],  # Projection dimensions/ratios
         subspace_func: str = "signmax",               # Aggregation within subspace
         postlift_func: str = "weighted_mean",         # Aggregation across scales
-        use_G: bool = False,
+        use_G: bool = False,  # Deprecated, kept for config compatibility
         device: str = "cuda",
+        transform_type: str | None = "srht",          # "fwht" | "srht" | "dct" | "dht" | "none" | None
         subspace_scope: str = "global",               # "per_tensor" | "layer" | "global"
         block_rows: int = 8192,
         weights: List[float] | None = None,           # Task weights
@@ -153,7 +150,7 @@ class MultiScaleFastfoodMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self.postlift_func = str(postlift_func).lower()
         
         # Core FastFood parameters
-        self.use_G = bool(use_G)
+        self.transform_type = str(transform_type)
         self.device = torch.device(device)
         self.subspace_scope = str(subspace_scope)
         self.block_rows = int(block_rows)
@@ -362,8 +359,11 @@ class MultiScaleFastfoodMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         # Get or create FastFood operator for this scale
                         cache_key = (seed_key, cur_D, proj_dim)
                         if cache_key not in op_cache:
-                            fwd, lift = _fastfood_ops(
-                                cur_D, proj_dim, seed_key=seed_key, device=dev, use_G=self.use_G
+                            fwd, lift = create_projection_ops(
+                                cur_D, proj_dim, 
+                                transform_type=self.transform_type,
+                                seed_key=seed_key, 
+                                device=dev
                             )
                             op_cache[cache_key] = (fwd, lift)
                         else:

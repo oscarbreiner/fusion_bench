@@ -1,0 +1,109 @@
+# ============================================================================
+# Random Subspace Task Vector Analysis Configuration
+# ============================================================================
+# This configuration analyzes task vectors in random subspaces using structured
+# projections (SRHT, FWHT, DCT, DHT). It compares geometric properties (L2 distance,
+# cosine similarity, sign conflicts) between original and projected spaces.
+#
+# Key Insights:
+# - Intrinsic dimensionality of task vector differences
+# - Robustness of merging strategies to dimension reduction
+# - Optimal subspace dimensions for efficient merging
+# - Stability of geometric relationships under projection
+# ============================================================================
+
+_target_: fusion_bench.method.analysis.RandomSubspaceTaskVectorAnalysis
+
+# ============================================================================
+# Projection Configuration
+# ============================================================================
+proj_ratios: [0.1, 0.25, 0.5, 0.75, 0.9]  # List of projection ratios to analyze
+                                            # Each ratio m/d determines subspace dimension
+                                            # Sweep from low (0.1) to high (0.9) for insights
+
+transform_type: "srht"                      # Projection type:
+                                            # - "srht": Subsampled Randomized Hadamard Transform (recommended)
+                                            # - "fwht": Full Walsh-Hadamard Transform (no subsampling)
+                                            # - "dct":  Discrete Cosine Transform (smooth projection)
+                                            # - "dht":  Discrete Hartley Transform (real-valued)
+
+num_random_seeds: 3                         # Number of random seeds to average over
+                                            # Increases robustness of results
+                                            # Recommended: 3-5 for balance between accuracy and speed
+
+# ============================================================================
+# Task Vector Extraction
+# ============================================================================
+trainable_only: true                        # Only analyze trainable parameters
+                                            # Recommended: true (focuses on learned differences)
+
+max_points_per_model: null                  # Max parameters to sample per model
+                                            # null = use all parameters
+                                            # Set to integer (e.g., 1000000) for memory efficiency
+
+# ============================================================================
+# Output Configuration
+# ============================================================================
+output_path: null                           # Directory to save outputs
+                                            # null = uses fabric logger directory
+                                            # Recommended: "./results/random_subspace_analysis"
+
+method_name: "default"                      # Name prefix for output files
+                                            # Useful for organizing multiple experiments
+                                            # Example: "clip_vit_b32_srht"
+
+device: "cuda"                              # Device for computations
+                                            # Options: "cuda", "cpu"
+
+# ============================================================================
+# Visualization Options
+# ============================================================================
+plot_heatmaps: true                         # Generate heatmaps of original space metrics
+                                            # Shows pairwise relationships between task vectors
+
+plot_preservation: true                     # Plot metric preservation vs projection ratio
+                                            # Key visualization: shows how well metrics are preserved
+                                            # as dimension decreases
+
+plot_distributions: true                    # Plot distributions of metric changes
+                                            # Shows variability of metrics across projections
+
+compute_correlations: true                  # Compute correlations between original and projected metrics
+                                            # Quantifies how well projections preserve relationships
+
+# ============================================================================
+# Recommended Configurations for Different Use Cases
+# ============================================================================
+
+# Fast exploration (quick sanity check):
+# proj_ratios: [0.25, 0.5, 0.75]
+# num_random_seeds: 1
+# plot_heatmaps: false
+# plot_distributions: false
+
+# Standard analysis (balanced):
+# proj_ratios: [0.1, 0.25, 0.5, 0.75, 0.9]
+# num_random_seeds: 3
+# plot_heatmaps: true
+# plot_preservation: true
+# plot_distributions: true
+
+# Comprehensive analysis (publication-ready):
+# proj_ratios: [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+# num_random_seeds: 5
+# transform_type: "srht"  # Compare with "dct", "dht" in separate runs
+# plot_heatmaps: true
+# plot_preservation: true
+# plot_distributions: true
+# compute_correlations: true
+
+# ============================================================================
+# Usage Example
+# ============================================================================
+# fusion_bench \
+#   method=analysis/random_subspace_task_vector_analysis \
+#   method.proj_ratios=[0.1,0.25,0.5,0.75] \
+#   method.transform_type=srht \
+#   method.num_random_seeds=3 \
+#   method.output_path=./results/subspace_analysis \
+#   modelpool=clip-vit-base-patch32_TA8

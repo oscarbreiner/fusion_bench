@@ -9,3 +9,4 @@ from .intrinsic_dimension_analysis import IntrinsicDimensionAnalysis
 from .linear_weights_similarity_original import LinearWeightsSimilarityOriginal
 from .linear_weights_similarity_intrinsic import LinearWeightsSimilarityIntrinsic
 from .adaptive_subspace_budget import AdaptiveSubspaceBudgetAnalysis
+from .random_subspace_task_vector_analysis import RandomSubspaceTaskVectorAnalysis

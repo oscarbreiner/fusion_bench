@@ -83,13 +83,19 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
       # Adaptive projection sizing:
       use_adaptive_proj_size: bool
       adaptive_proj_mode: "tensor" | "layer"
-      adaptive_proj_strategy: "fixed" | "random" | "rank"
+      adaptive_proj_strategy: "fixed" | "random" | "rank" | "layer_progressive" | "layer_group"
       adaptive_proj_m_min: int
       adaptive_proj_f_max: float
       adaptive_proj_pow2: bool
       adaptive_proj_pow2_mode: "ceil" | "floor" | "nearest"
       adaptive_proj_beta: float
       adaptive_proj_seed: int | None
+      adaptive_proj_start_ratio: float
+      adaptive_proj_end_ratio: float
+      adaptive_proj_growth_mode: "linear" | "exponential"
+      adaptive_proj_group_boundary: int
+      adaptive_proj_feature_ratio: float
+      adaptive_proj_head_ratio: float
     """
 
     def __init__(
@@ -140,6 +146,12 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         adaptive_proj_pow2_mode: str = "ceil",
         adaptive_proj_beta: float = 2.5,
         adaptive_proj_seed: int | None = None,
+        adaptive_proj_start_ratio: float = 0.1,
+        adaptive_proj_end_ratio: float = 1.0,
+        adaptive_proj_growth_mode: str = "linear",
+        adaptive_proj_group_boundary: int = 5,
+        adaptive_proj_feature_ratio: float = 0.3,
+        adaptive_proj_head_ratio: float = 0.8,
         # Kept in signature for compatibility (not used)
         ties_trim_pct: float = 0.0,
         tadrop_tau: float = 0.0,
@@ -198,6 +210,12 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 pow2_mode=str(adaptive_proj_pow2_mode),
                 ratio=self.proj_ratio,  # Use main proj_ratio for fixed strategy
                 beta=float(adaptive_proj_beta),
+                start_proj_ratio=float(adaptive_proj_start_ratio),
+                end_proj_ratio=float(adaptive_proj_end_ratio),
+                growth_mode=str(adaptive_proj_growth_mode),
+                group_boundary_layer=int(adaptive_proj_group_boundary),
+                feature_proj_ratio=float(adaptive_proj_feature_ratio),
+                head_proj_ratio=float(adaptive_proj_head_ratio),
                 rng=_random.Random(adaptive_proj_seed) if adaptive_proj_seed is not None else None,
             )
         else:
@@ -232,9 +250,18 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         param_name: str,
         tensor: torch.Tensor,
         layer_params: Dict[str, torch.Tensor] | None = None,
+        layer_idx: int = 0,
+        num_layers: int = 1,
     ) -> int:
         """
         Compute projection size for a parameter tensor.
+        
+        Args:
+            param_name: Name of the parameter
+            tensor: Parameter tensor
+            layer_params: Dictionary of layer parameters (for layer mode)
+            layer_idx: Current layer index (for layer_progressive strategy)
+            num_layers: Total number of layers (for layer_progressive strategy)
         """
         if not self.use_adaptive_proj_size:
             d_last = int(tensor.shape[-1])
@@ -254,15 +281,45 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             if mode == "layer":
                 if layer_params is None:
                     raise ValueError("layer_params required for adaptive layer mode")
-                m = proj_size_for(layer_params, mode="layer", strategy=strategy, cfg=self.proj_size_cfg)
+                m = proj_size_for(
+                    layer_params, mode="layer", strategy=strategy, cfg=self.proj_size_cfg,
+                    layer_idx=layer_idx, num_layers=num_layers
+                )
             else:  # tensor mode
-                m = proj_size_for(tensor, mode="tensor", strategy=strategy, cfg=self.proj_size_cfg)
+                m = proj_size_for(
+                    tensor, mode="tensor", strategy=strategy, cfg=self.proj_size_cfg,
+                    layer_idx=layer_idx, num_layers=num_layers
+                )
 
             return m
         except Exception as e:
             print(f"[Adaptive Proj Size] Error for {param_name}: {e}, falling back to fixed ratio")
             d_last = int(tensor.shape[-1])
             return max(1, int(d_last * self.proj_ratio))
+
+    def _build_layer_index_map(self, keys: List[str]) -> Tuple[Dict[str, int], int]:
+        """
+        Build a mapping from parameter name to layer index for layer_progressive strategy.
+        
+        Returns:
+            (param_to_layer_idx, num_layers) - mapping and total layer count
+        """
+        # Group parameters by layer key
+        layer_keys_ordered = []
+        seen = set()
+        for k in keys:
+            lk = _layer_key(k)
+            if lk not in seen:
+                layer_keys_ordered.append(lk)
+                seen.add(lk)
+        
+        num_layers = len(layer_keys_ordered)
+        layer_to_idx = {lk: i for i, lk in enumerate(layer_keys_ordered)}
+        
+        # Map each parameter to its layer index
+        param_to_idx = {k: layer_to_idx[_layer_key(k)] for k in keys}
+        
+        return param_to_idx, num_layers
 
     # ------------------- main -------------------
     @torch.no_grad()
@@ -372,6 +429,12 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         if torch.is_floating_point(tv_cpu[k]) and tv_cpu[k].ndim >= 1
                     ]
 
+                    # Build layer index map for layer_progressive strategy
+                    if self.use_adaptive_proj_size and self.adaptive_proj_strategy == "layer_progressive":
+                        param_to_layer_idx_ta, num_layers_ta = self._build_layer_index_map(keys_float_ta)
+                    else:
+                        param_to_layer_idx_ta, num_layers_ta = {}, 1
+
                     # operator cache (include transform type!)
                     op_cache_ta: Dict[Tuple[str, str, int, int], Tuple[Any, Any]] = {}
 
@@ -407,12 +470,17 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
                         # Compute projection size (adaptive or fixed)
                         if self.use_adaptive_proj_size:
+                            layer_idx_ta = param_to_layer_idx_ta.get(name, 0)
                             if self.adaptive_proj_mode == "layer":
                                 lkey = layer_key(name)
                                 layer_params_ta = {k: tv_cpu[k] for k in keys_float_ta if layer_key(k) == lkey}
-                                proj_dim = self._compute_proj_size(name, tb, layer_params_ta)
+                                proj_dim = self._compute_proj_size(
+                                    name, tb, layer_params_ta, layer_idx_ta, num_layers_ta
+                                )
                             else:
-                                proj_dim = self._compute_proj_size(name, tb)
+                                proj_dim = self._compute_proj_size(
+                                    name, tb, None, layer_idx_ta, num_layers_ta
+                                )
                         else:
                             proj_dim = max(1, int(cur_D * self.proj_ratio))
 
@@ -636,6 +704,13 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         merged_tensors = 0
         changed_params = 0
 
+        # Build layer index map for layer_progressive strategy
+        if self.use_adaptive_proj_size and self.adaptive_proj_strategy == "layer_progressive":
+            param_to_layer_idx, num_layers = self._build_layer_index_map(keys_float)
+            print(f"[Layer Progressive] Detected {num_layers} layers for progressive sizing")
+        else:
+            param_to_layer_idx, num_layers = {}, 1
+
         # operator cache keyed by (transform_type, seed_key, cur_D, proj_dim)
         op_cache: Dict[Tuple[str, str, int, int], Tuple[Any, Any]] = {}
 
@@ -673,12 +748,13 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     flat_dim = tb.numel()
                     vb_flat = tb.view(-1).float()
 
+                    layer_idx = param_to_layer_idx.get(name, 0)
                     if self.use_adaptive_proj_size and self.adaptive_proj_mode == "layer":
                         lkey = layer_key(name)
                         layer_params = self._layer_groups.get(lkey, {name: tb})
-                        proj_dim = self._compute_proj_size(name, tb, layer_params)
+                        proj_dim = self._compute_proj_size(name, tb, layer_params, layer_idx, num_layers)
                     else:
-                        proj_dim = self._compute_proj_size(name, tb)
+                        proj_dim = self._compute_proj_size(name, tb, None, layer_idx, num_layers)
 
                     seed_key = proj_seed_key(name)
                     cur_D = flat_dim
@@ -766,12 +842,13 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 vb = tb.view(rows, d_last).float()
                 br = min(self.block_rows, rows)
 
+                layer_idx = param_to_layer_idx.get(name, 0)
                 if self.use_adaptive_proj_size and self.adaptive_proj_mode == "layer":
                     lkey = layer_key(name)
                     layer_params = self._layer_groups.get(lkey, {name: tb})
-                    proj_dim = self._compute_proj_size(name, tb, layer_params)
+                    proj_dim = self._compute_proj_size(name, tb, layer_params, layer_idx, num_layers)
                 else:
-                    proj_dim = self._compute_proj_size(name, tb)
+                    proj_dim = self._compute_proj_size(name, tb, None, layer_idx, num_layers)
 
                 seed_key = proj_seed_key(name)
                 cur_D = global_D if (global_D is not None) else d_last

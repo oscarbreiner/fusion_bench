@@ -29,13 +29,30 @@ transform_type: "srht"       # Options: srht | fwht | dct | dht | none
 # ============================================================================
 use_adaptive_proj_size: false # Enable adaptive projection size estimation
 adaptive_proj_mode: "tensor"  # "tensor" | "layer" (scope for rank estimation)
-adaptive_proj_strategy: "rank" # "fixed" | "random" | "rank"
+adaptive_proj_strategy: "rank" # "fixed" | "random" | "rank" | "layer_progressive"
 adaptive_proj_m_min: 64       # Minimum projection size
 adaptive_proj_f_max: 0.5      # Maximum fraction of d_last
 adaptive_proj_pow2: true      # Round to power-of-2
 adaptive_proj_pow2_mode: "ceil" # "ceil" | "floor" | "nearest"
 adaptive_proj_beta: 2.5       # For "rank" strategy: m = beta * estimated_rank
 adaptive_proj_seed: null      # Random seed for "random" strategy (null = use global random)
+
+# Layer Progressive Strategy Parameters (for adaptive_proj_strategy="layer_progressive")
+adaptive_proj_start_ratio: 0.1  # Starting ratio (0.0-1.0) for first layer
+adaptive_proj_end_ratio: 1.0    # Ending ratio (0.0-1.0) for last layer
+adaptive_proj_growth_mode: "linear" # "linear" | "exponential"
+                               # - linear: ratio(t) = start + t * (end - start)
+                               # - exponential: ratio(t) = start * (end/start)^t
+                               # where t ∈ [0,1] is normalized layer position
+                               # Final projection size: m = ratio * d_last
+
+# Layer Group Strategy Parameters (for adaptive_proj_strategy="layer_group")
+adaptive_proj_group_boundary: 5    # Layer index separating feature extraction from head
+adaptive_proj_feature_ratio: 0.3   # Projection ratio for feature extraction layers (0.0-1.0)
+adaptive_proj_head_ratio: 0.8      # Projection ratio for head layers (0.0-1.0)
+                               # Layers 0 to boundary-1: use feature_ratio
+                               # Layers >= boundary: use head_ratio
+                               # Final projection size: m = ratio * d_last
 
 # ============================================================================
 # Weight Matching Preprocessing (Optional - Git Re-Basin)

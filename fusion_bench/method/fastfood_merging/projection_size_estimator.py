@@ -7,12 +7,17 @@ Supports two modes:
   - tensor: Per-tensor projection size estimation
   - layer: Per-layer projection size estimation (shared across layer's parameters)
 
-Three strategies:
+Four strategies:
   - fixed: m = ratio * d_last
   - random: m ~ U[m_min, f_max * d_last]
   - rank: m = beta * estimated_rank
     - Tensor mode: uses stable rank (||W||_F^2 / ||W||_2^2) via power iteration
     - Layer mode: uses effective rank (entropy-based) from SVD variance spectrum
+  - layer_progressive: Progressive scaling from start_proj_size to end_proj_size
+    - Requires layer_idx and num_layers
+    - Linear growth: m(t) = start + t * (end - start)
+    - Exponential growth: m(t) = start * (end/start)^t
+    - where t = layer_idx / (num_layers - 1) ∈ [0,1]
 
 Usage Example:
     >>> from projection_size_estimator import ProjSizeCfg, proj_size_for
@@ -26,6 +31,11 @@ Usage Example:
     >>> # Layer mode with rank strategy
     >>> layer_params = {"attn.weight": torch.randn(512, 256), "attn.bias": torch.randn(512)}
     >>> m = proj_size_for(layer_params, mode="layer", strategy="rank", cfg=cfg)
+    >>> 
+    >>> # Layer progressive strategy
+    >>> cfg_progressive = ProjSizeCfg(start_proj_size=64, end_proj_size=512, growth_mode="linear")
+    >>> m = proj_size_for(weight, mode="tensor", strategy="layer_progressive", 
+    ...                   cfg=cfg_progressive, layer_idx=5, num_layers=12)
 """
 
 from __future__ import annotations
@@ -35,9 +45,16 @@ import math
 import random
 import torch
 
+from dataclasses import dataclass, field
+from typing import Dict, Literal, Optional
+import random
+import math
+import torch
+
 Mode = Literal["tensor", "layer"]
-Strategy = Literal["fixed", "random", "rank"]
+Strategy = Literal["fixed", "random", "rank", "layer_progressive", "layer_group"]
 Pow2Mode = Literal["ceil", "floor", "nearest"]
+GrowthMode = Literal["linear", "exponential"]
 
 
 # ============================================================================
@@ -58,6 +75,10 @@ class ProjSizeCfg:
         ratio: For "fixed" strategy - m = ratio * d_last
         beta: For "rank" strategy - m = beta * estimated_rank
         
+        start_proj_ratio: For "layer_progressive" strategy - projection ratio at first layer (0.0-1.0)
+        end_proj_ratio: For "layer_progressive" strategy - projection ratio at last layer (0.0-1.0)
+        growth_mode: For "layer_progressive" strategy - "linear" or "exponential" growth
+        
         rng: Random number generator for "random" strategy (uses global if None)
     """
     m_min: int = 16
@@ -67,6 +88,15 @@ class ProjSizeCfg:
     
     ratio: float = 0.25
     beta: float = 2.5
+    
+    start_proj_ratio: float = 0.1
+    end_proj_ratio: float = 1.0
+    growth_mode: GrowthMode = "linear"
+    
+    # Layer group strategy parameters
+    group_boundary_layer: int = 5  # Layer index separating feature extraction from head
+    feature_proj_ratio: float = 0.3  # Projection ratio for feature extraction layers
+    head_proj_ratio: float = 0.8  # Projection ratio for head layers
     
     rng: Optional[random.Random] = None
 
@@ -137,6 +167,107 @@ def clip_and_pow2(
     """
     m = max(m_min, min(int(m), int(m_max)))
     return round_pow2(m, mode) if use_pow2 else m
+
+
+# ============================================================================
+# Layer Progressive Projection Size Computation
+# ============================================================================
+
+def compute_layer_progressive_ratio(
+    layer_idx: int,
+    num_layers: int,
+    start_ratio: float,
+    end_ratio: float,
+    growth_mode: GrowthMode = "linear"
+) -> float:
+    """
+    Compute projection ratio for a layer based on its index using progressive scaling.
+    
+    Args:
+        layer_idx: Current layer index (0-based)
+        num_layers: Total number of layers
+        start_ratio: Projection ratio at first layer (0.0-1.0, layer_idx=0)
+        end_ratio: Projection ratio at last layer (0.0-1.0, layer_idx=num_layers-1)
+        growth_mode: "linear" or "exponential" growth
+        
+    Returns:
+        Projection ratio for the given layer (0.0-1.0)
+        
+    Examples:
+        >>> # Linear growth from 0.1 to 1.0 over 10 layers
+        >>> compute_layer_progressive_ratio(0, 10, 0.1, 1.0, "linear")
+        0.1
+        >>> compute_layer_progressive_ratio(9, 10, 0.1, 1.0, "linear")
+        1.0
+        >>> compute_layer_progressive_ratio(5, 10, 0.1, 1.0, "linear")
+        0.55
+        
+        >>> # Exponential growth
+        >>> compute_layer_progressive_ratio(0, 10, 0.1, 1.0, "exponential")
+        0.1
+        >>> compute_layer_progressive_ratio(9, 10, 0.1, 1.0, "exponential")
+        1.0
+    """
+    if num_layers <= 1:
+        return start_ratio
+    
+    # Normalize layer position to [0, 1]
+    t = layer_idx / (num_layers - 1)
+    
+    if growth_mode == "linear":
+        # Linear interpolation: r(t) = start + t * (end - start)
+        ratio = start_ratio + t * (end_ratio - start_ratio)
+    elif growth_mode == "exponential":
+        # Exponential growth: r(t) = start * (end/start)^t
+        if start_ratio <= 0:
+            return start_ratio
+        ratio_mult = end_ratio / start_ratio
+        ratio = start_ratio * (ratio_mult ** t)
+    else:
+        raise ValueError(f"Unknown growth_mode: {growth_mode}")
+    
+    return float(ratio)
+
+
+# ============================================================================
+# Layer Group Projection Size Computation
+# ============================================================================
+
+def compute_layer_group_ratio(
+    layer_idx: int,
+    boundary_layer: int,
+    feature_ratio: float,
+    head_ratio: float
+) -> float:
+    """
+    Compute projection ratio based on layer group (feature extraction vs head).
+    
+    This strategy splits the network into two groups:
+    - Feature extraction layers (layer_idx < boundary_layer): use feature_ratio
+    - Head layers (layer_idx >= boundary_layer): use head_ratio
+    
+    Args:
+        layer_idx: Current layer index (0-based)
+        boundary_layer: Layer index threshold separating groups
+        feature_ratio: Projection ratio for feature extraction layers (0.0-1.0)
+        head_ratio: Projection ratio for head layers (0.0-1.0)
+        
+    Returns:
+        Projection ratio for the given layer (0.0-1.0)
+        
+    Examples:
+        >>> # Split at layer 5, feature extraction uses 30%, head uses 80%
+        >>> compute_layer_group_ratio(3, 5, 0.3, 0.8)
+        0.3
+        >>> compute_layer_group_ratio(5, 5, 0.3, 0.8)
+        0.8
+        >>> compute_layer_group_ratio(10, 5, 0.3, 0.8)
+        0.8
+    """
+    if layer_idx < boundary_layer:
+        return float(feature_ratio)
+    else:
+        return float(head_ratio)
 
 
 # ============================================================================
@@ -356,15 +487,19 @@ def effective_rank_layer(layer_params: Dict[str, torch.Tensor]) -> float:
 def proj_size_for_tensor(
     W: torch.Tensor,
     strategy: Strategy,
-    cfg: ProjSizeCfg
+    cfg: ProjSizeCfg,
+    layer_idx: int = 0,
+    num_layers: int = 1
 ) -> int:
     """
     Compute projection size for a single tensor.
     
     Args:
         W: Parameter tensor
-        strategy: "fixed", "random", or "rank"
+        strategy: "fixed", "random", "rank", or "layer_progressive"
         cfg: Configuration for projection size estimation
+        layer_idx: Current layer index (for layer_progressive strategy)
+        num_layers: Total number of layers (for layer_progressive strategy)
         
     Returns:
         Projection size m
@@ -373,13 +508,25 @@ def proj_size_for_tensor(
     m_max = max(cfg.m_min, int(cfg.f_max * d_last))
     
     if strategy == "fixed":
-        m_tgt = max(1, int(round(cfg.ratio * d_last)))
+        m_tgt = int(cfg.ratio * d_last)
     elif strategy == "random":
         rng = cfg.rng or random
         m_tgt = rng.randint(cfg.m_min, m_max)
     elif strategy == "rank":
-        r_hat = stable_rank_tensor(W)  # SVD-free, tensor mode
-        m_tgt = max(1, int(round(cfg.beta * r_hat)))
+        r = stable_rank_tensor(W)
+        m_tgt = int(cfg.beta * r)
+    elif strategy == "layer_progressive":
+        # Compute progressive ratio and apply to d_last
+        prog_ratio = compute_layer_progressive_ratio(
+            layer_idx, num_layers, cfg.start_proj_ratio, cfg.end_proj_ratio, cfg.growth_mode
+        )
+        m_tgt = int(prog_ratio * d_last)
+    elif strategy == "layer_group":
+        # Compute group-based ratio and apply to d_last
+        group_ratio = compute_layer_group_ratio(
+            layer_idx, cfg.group_boundary_layer, cfg.feature_proj_ratio, cfg.head_proj_ratio
+        )
+        m_tgt = int(group_ratio * d_last)
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
     
@@ -389,7 +536,9 @@ def proj_size_for_tensor(
 def proj_size_for_layer(
     layer_params: Dict[str, torch.Tensor],
     strategy: Strategy,
-    cfg: ProjSizeCfg
+    cfg: ProjSizeCfg,
+    layer_idx: int = 0,
+    num_layers: int = 1
 ) -> int:
     """
     Compute a single projection size for an entire layer group.
@@ -398,8 +547,10 @@ def proj_size_for_layer(
     
     Args:
         layer_params: Dictionary of parameter name -> tensor for a layer
-        strategy: "fixed", "random", or "rank"
+        strategy: "fixed", "random", "rank", or "layer_progressive"
         cfg: Configuration for projection size estimation
+        layer_idx: Current layer index (for layer_progressive strategy)
+        num_layers: Total number of layers (for layer_progressive strategy)
         
     Returns:
         Projection size m (shared across layer)
@@ -412,22 +563,32 @@ def proj_size_for_layer(
     ]
     
     if not d_candidates:
-        return clip_and_pow2(
-            cfg.m_min, cfg.m_min, cfg.m_min,
-            cfg.pow2_round, cfg.pow2_mode
-        )
+        # No 2D/4D tensors, fallback to m_min
+        return cfg.m_min
     
     d_last = max(d_candidates)
     m_max = max(cfg.m_min, int(cfg.f_max * d_last))
     
     if strategy == "fixed":
-        m_tgt = max(1, int(round(cfg.ratio * d_last)))
+        m_tgt = int(cfg.ratio * d_last)
     elif strategy == "random":
         rng = cfg.rng or random
         m_tgt = rng.randint(cfg.m_min, m_max)
     elif strategy == "rank":
-        r_eff = effective_rank_layer(layer_params)  # SVD+entropy, layer mode
-        m_tgt = max(1, int(round(cfg.beta * r_eff)))
+        r = effective_rank_layer(layer_params)
+        m_tgt = int(cfg.beta * r)
+    elif strategy == "layer_progressive":
+        # Compute progressive ratio and apply to d_last
+        prog_ratio = compute_layer_progressive_ratio(
+            layer_idx, num_layers, cfg.start_proj_ratio, cfg.end_proj_ratio, cfg.growth_mode
+        )
+        m_tgt = int(prog_ratio * d_last)
+    elif strategy == "layer_group":
+        # Compute group-based ratio and apply to d_last
+        group_ratio = compute_layer_group_ratio(
+            layer_idx, cfg.group_boundary_layer, cfg.feature_proj_ratio, cfg.head_proj_ratio
+        )
+        m_tgt = int(group_ratio * d_last)
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
     
@@ -442,7 +603,9 @@ def proj_size_for(
     unit: torch.Tensor | Dict[str, torch.Tensor],
     mode: Mode,
     strategy: Strategy,
-    cfg: ProjSizeCfg
+    cfg: ProjSizeCfg,
+    layer_idx: int = 0,
+    num_layers: int = 1
 ) -> int:
     """
     Unified entry point for projection size estimation.
@@ -450,8 +613,10 @@ def proj_size_for(
     Args:
         unit: Either a single tensor (mode="tensor") or dict of tensors (mode="layer")
         mode: "tensor" or "layer"
-        strategy: "fixed", "random", or "rank"
+        strategy: "fixed", "random", "rank", or "layer_progressive"
         cfg: Configuration for projection size estimation
+        layer_idx: Current layer index (for layer_progressive strategy)
+        num_layers: Total number of layers (for layer_progressive strategy)
         
     Returns:
         Projection size m
@@ -468,15 +633,20 @@ def proj_size_for(
         >>> layer = {"attn.weight": torch.randn(512, 256), "attn.bias": torch.randn(512)}
         >>> m = proj_size_for(layer, mode="layer", strategy="rank", cfg=cfg)
         >>> print(f"Layer projection size: {m}")
+        >>> 
+        >>> # Layer progressive strategy
+        >>> m = proj_size_for(weight, mode="tensor", strategy="layer_progressive", 
+        ...                   cfg=cfg, layer_idx=5, num_layers=12)
+        >>> print(f"Progressive projection size at layer 5/12: {m}")
     """
     if mode == "tensor":
         if not isinstance(unit, torch.Tensor):
             raise TypeError("tensor mode expects a single torch.Tensor")
-        return proj_size_for_tensor(unit, strategy, cfg)
+        return proj_size_for_tensor(unit, strategy, cfg, layer_idx, num_layers)
     elif mode == "layer":
         if not isinstance(unit, dict):
             raise TypeError("layer mode expects Dict[str, torch.Tensor]")
-        return proj_size_for_layer(unit, strategy, cfg)
+        return proj_size_for_layer(unit, strategy, cfg, layer_idx, num_layers)
     else:
         raise ValueError(f"Unknown mode: {mode}. Expected 'tensor' or 'layer'")
 
@@ -534,5 +704,33 @@ if __name__ == "__main__":
     cfg_random = ProjSizeCfg(m_min=16, f_max=0.5, pow2_round=True, rng=random.Random(42))
     m = proj_size_for(linear_weight, mode="tensor", strategy="random", cfg=cfg_random)
     print(f"   Random projection size (with seed 42): m={m}\n")
+    
+    print("6. Layer Progressive Strategy - Linear Growth")
+    cfg_progressive = ProjSizeCfg(
+        start_proj_size=64, 
+        end_proj_size=512, 
+        growth_mode="linear",
+        pow2_round=True
+    )
+    print("   Progressive sizes (12 layers, linear growth):")
+    for i in range(12):
+        m = proj_size_for(linear_weight, mode="tensor", strategy="layer_progressive", 
+                         cfg=cfg_progressive, layer_idx=i, num_layers=12)
+        print(f"     Layer {i:2d}: m={m:4d}")
+    print()
+    
+    print("7. Layer Progressive Strategy - Exponential Growth")
+    cfg_exp = ProjSizeCfg(
+        start_proj_size=64, 
+        end_proj_size=512, 
+        growth_mode="exponential",
+        pow2_round=True
+    )
+    print("   Progressive sizes (12 layers, exponential growth):")
+    for i in range(12):
+        m = proj_size_for(linear_weight, mode="tensor", strategy="layer_progressive", 
+                         cfg=cfg_exp, layer_idx=i, num_layers=12)
+        print(f"     Layer {i:2d}: m={m:4d}")
+    print()
     
     print("=== Demo Complete ===")

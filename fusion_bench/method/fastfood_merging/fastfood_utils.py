@@ -75,6 +75,12 @@ def seed_from_string(s: str) -> int:
     """Deterministic seed from string."""
     return int.from_bytes(hashlib.md5(s.encode("utf-8")).digest()[:4], "little")
 
+def _rng_from_seed(seed_key: str, device: torch.device | None = None) -> torch.Generator:
+    g = torch.Generator(device=device)
+    g.manual_seed(seed_from_string(seed_key))
+    return g
+
+
 # ============================================================================
 # Orthonormal transforms (FWHT / DCT-II / DHT)
 #   - Each F is orthonormal (F^T = F^{-1})
@@ -83,23 +89,21 @@ def seed_from_string(s: str) -> int:
 
 @torch.no_grad()
 def fwht_inplace_ortho(x: Tensor) -> Tensor:
-    """
-    In-place orthonormal Fast Walsh–Hadamard Transform (FWHT) on last dim.
-    Requires last dimension to be a power of 2. Scaled by 1/sqrt(n).
-    """
-    n = x.shape[-1]
+    # orthonormal FWHT on last dim, preserve leading dims
+    *lead, n = x.shape
     if n <= 1:
         return x
     h = 1
+    y = x.reshape(-1, n).contiguous()  # keep batch as first dim
     while h < n:
-        x = x.view(-1, n // (2 * h), 2, h)
-        a = x[..., 0, :].clone()
-        b = x[..., 1, :]
-        x[..., 0, :], x[..., 1, :] = a + b, a - b
-        x = x.view(-1, n)
+        y = y.view(-1, n // (2*h), 2, h)
+        a = y[..., 0, :].clone()
+        b = y[..., 1, :]
+        y[..., 0, :], y[..., 1, :] = a + b, a - b
+        y = y.view(-1, n)
         h *= 2
-    x.mul_(1.0 / math.sqrt(n))
-    return x
+    y.mul_(1.0 / math.sqrt(n))
+    return y.view(*lead, n)
 
 @torch.no_grad()
 def dct_ortho(x: Tensor) -> Tensor:
@@ -110,9 +114,9 @@ def dct_ortho(x: Tensor) -> Tensor:
 
 @torch.no_grad()
 def idct_ortho(x: Tensor) -> Tensor:
-    """Inverse DCT (DCT-III for type II forward)."""
+    # Inverse of DCT-II (ortho) is DCT-III (ortho)
     x_np = x.detach().cpu().numpy()
-    X = sp_idct(x_np, type=2, norm="ortho", axis=-1)
+    X = sp_idct(x_np, type=3, norm="ortho", axis=-1)
     return torch.from_numpy(X).to(x.device, dtype=x.dtype)
 
 @torch.no_grad()
@@ -263,14 +267,17 @@ def create_projection_ops(
             return y.contiguous()
         
         return identity_fwd, identity_lift
-    torch.manual_seed(seed_from_string(seed_key))
+
     D = int(global_dim)
     tfm = OrthoTransform(kind, D, device)
     L = tfm.L
     m = int(proj_dim)
 
     # Random sign diagonal (as vector) used for ALL modes for consistency
-    B = _rand_signs(L, device)
+    # B = _rand_signs(L, device)
+    g = _rng_from_seed(seed_key, device=device)
+    B = (torch.randint(0, 2, (L,), generator=g, dtype=torch.int8, device=device) * 2 - 1)
+    B = B.to(dtype=torch.float32)
 
     if kind == "fwht":
         if m != L:
@@ -281,7 +288,7 @@ def create_projection_ops(
         if not (1 <= m <= L):
             raise ValueError(f"proj_dim (m) must satisfy 1 <= m <= L ({L}), got {m}")
         scale = math.sqrt(L / m)
-        row_idx = torch.randperm(L, device=device)[:m]  # P: row selector
+        row_idx = torch.randperm(L, generator=g, device=device)[:m]  # P: row selector
 
     @torch.no_grad()
     def fwd(xD: Tensor) -> Tensor:

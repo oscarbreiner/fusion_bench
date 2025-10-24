@@ -16,23 +16,31 @@ block_rows: 16384             # Memory management for large tensors
 # ============================================================================
 # Transform Type
 # ============================================================================
-transform_type: "srht"       # Options: srht | fwht | dct | dht | none
+transform_type: "srht"       # Options: srht | fwht | dct | dht | none | fastfood
                               # - srht: Subsampled Hadamard (default, recommended)
                               # - fwht: Full Hadamard (no subsampling)
                               # - dct: Discrete Cosine Transform
                               # - dht: Discrete Hartley Transform
                               # - none (or null): No projection, merge in original space (baseline)
+                              # - fastfood: Original FastFood transform
 # This parameter can be swept via --transform_types in the workflow/SLURM/CLI for fastfood_merging
 
 # ============================================================================
 # Adaptive Projection Size Estimation (Optional)
 # ============================================================================
 use_adaptive_proj_size: false # Enable adaptive projection size estimation
-adaptive_proj_mode: "tensor"  # "tensor" | "layer" (scope for rank estimation)
-adaptive_proj_strategy: "rank" # "fixed" | "random" | "rank" | "layer_progressive"
+adaptive_proj_mode: "tensor"  # "tensor" | "layer" (scope for rank estimation and projection size computation)
+                              # - tensor: per-tensor projection size (uses individual tensor dimensions)
+                              # - layer: per-layer projection size (uses max dimension across layer tensors)
+adaptive_proj_strategy: "rank" # "fixed" | "random" | "rank" | "layer_progressive" | "layer_group"
+                              # - fixed: m = ratio * d_last
+                              # - random: m ~ U[m_min, f_max * d_last]
+                              # - rank: m = beta * estimated_rank
+                              # - layer_progressive: gradual scaling from start_ratio to end_ratio across layers
+                              # - layer_group: fixed ratio per group (feature extraction vs head)
 adaptive_proj_m_min: 64       # Minimum projection size
-adaptive_proj_f_max: 0.5      # Maximum fraction of d_last
-adaptive_proj_pow2: true      # Round to power-of-2
+adaptive_proj_f_max: 1.0      # Maximum fraction of d_last
+adaptive_proj_pow2: false      # Round to power-of-2
 adaptive_proj_pow2_mode: "ceil" # "ceil" | "floor" | "nearest"
 adaptive_proj_beta: 2.5       # For "rank" strategy: m = beta * estimated_rank
 adaptive_proj_seed: null      # Random seed for "random" strategy (null = use global random)
@@ -47,12 +55,14 @@ adaptive_proj_growth_mode: "linear" # "linear" | "exponential"
                                # Final projection size: m = ratio * d_last
 
 # Layer Group Strategy Parameters (for adaptive_proj_strategy="layer_group")
-adaptive_proj_group_boundary: 5    # Layer index separating feature extraction from head
-adaptive_proj_feature_ratio: 0.3   # Projection ratio for feature extraction layers (0.0-1.0)
-adaptive_proj_head_ratio: 0.8      # Projection ratio for head layers (0.0-1.0)
-                               # Layers 0 to boundary-1: use feature_ratio
-                               # Layers >= boundary: use head_ratio
-                               # Final projection size: m = ratio * d_last
+adaptive_proj_group_boundary: 5    # Layer index separating feature extraction from head (0-based)
+adaptive_proj_feature_ratio: 0.3   # FIXED projection ratio for feature extraction layers (0.0-1.0)
+                               # Applied to layers 0 to boundary-1
+adaptive_proj_head_ratio: 0.8      # FIXED projection ratio for head layers (0.0-1.0)
+                               # Applied to layers >= boundary
+                               # Note: These are FIXED ratios per group, not adaptive
+                               # Final projection size: m = group_ratio * d_last
+                               # Compatible with ALL adaptive_proj_mode and subspace_scope settings
 
 # ============================================================================
 # Weight Matching Preprocessing (Optional - Git Re-Basin)

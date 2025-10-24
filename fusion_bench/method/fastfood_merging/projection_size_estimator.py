@@ -82,8 +82,8 @@ class ProjSizeCfg:
         rng: Random number generator for "random" strategy (uses global if None)
     """
     m_min: int = 16
-    f_max: float = 0.5
-    pow2_round: bool = True
+    f_max: float = 1.0
+    pow2_round: bool = False
     pow2_mode: Pow2Mode = "ceil"
     
     ratio: float = 0.25
@@ -664,7 +664,7 @@ if __name__ == "__main__":
     # Configuration
     cfg = ProjSizeCfg(
         m_min=16,
-        f_max=0.5,
+        f_max=1.0,
         ratio=0.25,
         beta=2.5,
         pow2_round=True,
@@ -701,7 +701,7 @@ if __name__ == "__main__":
     print(f"   Layer effective_rank={r_eff:.2f}, m={m}\n")
     
     print("5. Tensor Mode - Random Strategy")
-    cfg_random = ProjSizeCfg(m_min=16, f_max=0.5, pow2_round=True, rng=random.Random(42))
+    cfg_random = ProjSizeCfg(m_min=16, f_max=1.0, pow2_round=True, rng=random.Random(42))
     m = proj_size_for(linear_weight, mode="tensor", strategy="random", cfg=cfg_random)
     print(f"   Random projection size (with seed 42): m={m}\n")
     

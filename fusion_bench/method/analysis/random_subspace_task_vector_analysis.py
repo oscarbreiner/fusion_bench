@@ -232,15 +232,17 @@ class RandomSubspaceTaskVectorAnalysis(
         log.info("Analyzing random subspaces...")
         subspace_results = []
         all_projected_metrics = {}  # Store for heatmap generation
+        all_reconstructed_metrics = {}  # Store for reconstruction heatmap generation
         
         for proj_ratio in tqdm(self.proj_ratios, desc="Projection ratios"):
             ratio_metrics = []  # Store all seeds for this ratio
+            ratio_reconstructed_metrics = []  # Store reconstructed metrics for this ratio
             
             for seed_idx in tqdm(range(self.num_random_seeds), desc="Random seeds", leave=False):
                 seed_key = f"{self.transform_type}_ratio{proj_ratio}_seed{seed_idx}"
                 
                 # Project task vectors
-                projected_vectors = self._project_task_vectors(
+                projected_vectors, reconstructed_vectors = self._project_and_reconstruct_task_vectors(
                     task_vectors_tensor, proj_ratio, seed_key
                 )
                 
@@ -250,21 +252,41 @@ class RandomSubspaceTaskVectorAnalysis(
                     space_name=f"proj_{proj_ratio}_seed{seed_idx}"
                 )
                 
+                # Compute metrics in reconstructed space
+                reconstructed_metrics = self._compute_all_metrics(
+                    reconstructed_vectors, model_names,
+                    space_name=f"recon_{proj_ratio}_seed{seed_idx}"
+                )
+                
                 ratio_metrics.append(projected_metrics)
+                ratio_reconstructed_metrics.append(reconstructed_metrics)
                 
                 # Compare with original metrics
                 comparison = self._compare_metrics(
                     original_metrics, projected_metrics, proj_ratio, seed_idx
                 )
+                
+                # Add reconstruction comparison
+                recon_comparison = self._compare_reconstructed_metrics(
+                    original_metrics, reconstructed_metrics, proj_ratio, seed_idx
+                )
+                comparison.update(recon_comparison)
+                
                 subspace_results.append(comparison)
                 
                 # Save individual projection metrics
                 self._save_projection_metrics(
                     projected_metrics, proj_ratio, seed_idx
                 )
+                
+                # Save individual reconstruction metrics
+                self._save_reconstruction_metrics(
+                    reconstructed_metrics, proj_ratio, seed_idx
+                )
             
             # Store averaged metrics for this ratio (for heatmaps)
             all_projected_metrics[proj_ratio] = self._average_metrics_across_seeds(ratio_metrics)
+            all_reconstructed_metrics[proj_ratio] = self._average_metrics_across_seeds(ratio_reconstructed_metrics)
         
         # Aggregate results
         log.info("Aggregating results...")
@@ -276,7 +298,7 @@ class RandomSubspaceTaskVectorAnalysis(
         # Generate visualizations
         log.info("Generating visualizations...")
         self._generate_visualizations(
-            original_metrics, all_projected_metrics, summary_df, model_names
+            original_metrics, all_projected_metrics, all_reconstructed_metrics, summary_df, model_names
         )
         
         log.info("=" * 80)
@@ -318,6 +340,50 @@ class RandomSubspaceTaskVectorAnalysis(
         projected = torch.stack([fwd(tv) for tv in task_vectors])
         
         return projected
+
+    def _project_and_reconstruct_task_vectors(
+        self,
+        task_vectors: torch.Tensor,
+        proj_ratio: float,
+        seed_key: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Project task vectors into a random subspace and reconstruct them.
+        
+        Args:
+            task_vectors: Task vectors [num_models, vector_dim]
+            proj_ratio: Projection ratio (0.0-1.0)
+            seed_key: Seed key for deterministic projection
+            
+        Returns:
+            Tuple of (projected_vectors [num_models, proj_dim], 
+                     reconstructed_vectors [num_models, vector_dim])
+        """
+        num_models, global_dim = task_vectors.shape
+        proj_dim = max(1, int(global_dim * proj_ratio))
+        
+        # Create projection operators
+        fwd, lift = create_projection_ops(
+            global_dim=global_dim,
+            proj_dim=proj_dim,
+            transform_type=self.transform_type,
+            seed_key=seed_key,
+            device=self.device,
+        )
+        
+        # Project and reconstruct all task vectors
+        projected = []
+        reconstructed = []
+        for tv in task_vectors:
+            proj_tv = fwd(tv)
+            recon_tv = lift(proj_tv)
+            projected.append(proj_tv)
+            reconstructed.append(recon_tv)
+        
+        projected = torch.stack(projected)
+        reconstructed = torch.stack(reconstructed)
+        
+        return projected, reconstructed
 
     def _compute_all_metrics(
         self,
@@ -477,6 +543,66 @@ class RandomSubspaceTaskVectorAnalysis(
         
         return comparison
 
+    def _compare_reconstructed_metrics(
+        self,
+        original_metrics: Dict[str, pd.DataFrame],
+        reconstructed_metrics: Dict[str, pd.DataFrame],
+        proj_ratio: float,
+        seed_idx: int,
+    ) -> Dict[str, Any]:
+        """
+        Compare original and reconstructed metrics to measure reconstruction quality.
+        
+        Returns a dictionary with reconstruction error statistics.
+        """
+        comparison = {}
+        
+        for metric_name in ["cosine_similarity", "l2_distance", "sign_conflicts", "jaccard_similarity"]:
+            orig = original_metrics[metric_name].values
+            recon = reconstructed_metrics[metric_name].values
+            
+            # Get upper triangle (exclude diagonal)
+            mask = np.triu(np.ones_like(orig, dtype=bool), k=1)
+            orig_vals = orig[mask]
+            recon_vals = recon[mask]
+            
+            # Compute reconstruction quality statistics
+            if metric_name in ["cosine_similarity", "jaccard_similarity"]:
+                # For similarity metrics
+                correlation = np.corrcoef(orig_vals, recon_vals)[0, 1]
+                mae = np.mean(np.abs(orig_vals - recon_vals))
+                rmse = np.sqrt(np.mean((orig_vals - recon_vals) ** 2))
+                
+                comparison[f"recon_{metric_name}_correlation"] = correlation
+                comparison[f"recon_{metric_name}_mae"] = mae
+                comparison[f"recon_{metric_name}_rmse"] = rmse
+                comparison[f"recon_{metric_name}_orig_mean"] = np.mean(orig_vals)
+                comparison[f"recon_{metric_name}_recon_mean"] = np.mean(recon_vals)
+                
+            elif metric_name == "l2_distance":
+                # For L2 distance
+                correlation = np.corrcoef(orig_vals, recon_vals)[0, 1]
+                relative_error = np.mean(np.abs(orig_vals - recon_vals) / (orig_vals + 1e-8))
+                mae = np.mean(np.abs(orig_vals - recon_vals))
+                
+                comparison[f"recon_{metric_name}_correlation"] = correlation
+                comparison[f"recon_{metric_name}_relative_error"] = relative_error
+                comparison[f"recon_{metric_name}_mae"] = mae
+                comparison[f"recon_{metric_name}_orig_mean"] = np.mean(orig_vals)
+                comparison[f"recon_{metric_name}_recon_mean"] = np.mean(recon_vals)
+                
+            elif metric_name == "sign_conflicts":
+                # For sign conflicts
+                correlation = np.corrcoef(orig_vals, recon_vals)[0, 1]
+                mae = np.mean(np.abs(orig_vals - recon_vals))
+                
+                comparison[f"recon_{metric_name}_correlation"] = correlation
+                comparison[f"recon_{metric_name}_mae"] = mae
+                comparison[f"recon_{metric_name}_orig_mean"] = np.mean(orig_vals)
+                comparison[f"recon_{metric_name}_recon_mean"] = np.mean(recon_vals)
+        
+        return comparison
+
     def _average_metrics_across_seeds(
         self,
         metrics_list: List[Dict[str, pd.DataFrame]],
@@ -539,14 +665,43 @@ class RandomSubspaceTaskVectorAnalysis(
         with open(json_filepath, 'w') as f:
             json.dump(json_data, f, indent=2)
 
+    def _save_reconstruction_metrics(
+        self,
+        metrics: Dict[str, pd.DataFrame],
+        proj_ratio: float,
+        seed_idx: int,
+    ):
+        """Save metrics for reconstructed task vectors."""
+        # Save CSV files
+        for metric_name, df in metrics.items():
+            filename = (
+                f"reconstructed_{metric_name}_ratio{proj_ratio:.2f}_seed{seed_idx}_{self.method_name}.csv"
+            )
+            filepath = self.output_path / filename
+            df.to_csv(filepath)
+        
+        # Save JSON files for easier programmatic access
+        import json
+        json_filename = f"reconstructed_metrics_ratio{proj_ratio:.2f}_seed{seed_idx}_{self.method_name}.json"
+        json_filepath = self.output_path / json_filename
+        
+        json_data = {
+            metric_name: df.to_dict(orient='index')
+            for metric_name, df in metrics.items()
+        }
+        
+        with open(json_filepath, 'w') as f:
+            json.dump(json_data, f, indent=2)
+
     def _generate_visualizations(
         self,
         original_metrics: Dict[str, pd.DataFrame],
         all_projected_metrics: Dict[float, Dict[str, pd.DataFrame]],
+        all_reconstructed_metrics: Dict[float, Dict[str, pd.DataFrame]],
         summary_df: pd.DataFrame,
         model_names: List[str],
     ):
-        """Generate comprehensive visualizations including per-ratio heatmaps."""
+        """Generate comprehensive visualizations including per-ratio heatmaps and reconstruction analysis."""
         pdf_path = self.output_path / f"random_subspace_analysis_{self.method_name}.pdf"
         
         with PdfPages(pdf_path) as pdf:
@@ -558,11 +713,22 @@ class RandomSubspaceTaskVectorAnalysis(
             if self.plot_heatmaps:
                 self._plot_original_heatmaps(original_metrics, model_names, pdf)
             
-            # NEW: Plot 3: Heatmaps for each projection ratio
+            # Plot 3: Heatmaps for each projection ratio (projected space)
             if self.plot_heatmaps:
                 for proj_ratio in sorted(all_projected_metrics.keys()):
                     self._plot_projected_heatmaps(
                         all_projected_metrics[proj_ratio],
+                        model_names,
+                        proj_ratio,
+                        pdf,
+                    )
+            
+            # Plot 3b: Heatmaps for each projection ratio (reconstructed space)
+            if self.plot_heatmaps:
+                for proj_ratio in sorted(all_reconstructed_metrics.keys()):
+                    self._plot_reconstructed_heatmaps(
+                        original_metrics,
+                        all_reconstructed_metrics[proj_ratio],
                         model_names,
                         proj_ratio,
                         pdf,
@@ -579,7 +745,7 @@ class RandomSubspaceTaskVectorAnalysis(
         log.info(f"Saved visualizations to {pdf_path}")
         
         # Save heatmap data as JSON
-        self._save_heatmap_json(original_metrics, all_projected_metrics)
+        self._save_heatmap_json(original_metrics, all_projected_metrics, all_reconstructed_metrics)
 
     def _plot_metric_preservation(self, summary_df: pd.DataFrame, pdf: PdfPages):
         """Plot how metrics are preserved across projection ratios."""
@@ -778,12 +944,129 @@ class RandomSubspaceTaskVectorAnalysis(
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
+    def _plot_reconstructed_heatmaps(
+        self,
+        original_metrics: Dict[str, pd.DataFrame],
+        reconstructed_metrics: Dict[str, pd.DataFrame],
+        model_names: List[str],
+        proj_ratio: float,
+        pdf: PdfPages,
+    ):
+        """Plot heatmaps comparing original vs reconstructed metrics for a specific projection ratio."""
+        fig, axes = plt.subplots(4, 4, figsize=(24, 24))
+        fig.suptitle(
+            f"Reconstruction Quality Analysis (ratio={proj_ratio:.2f}, {self.transform_type.upper()})",
+            fontsize=18,
+            fontweight="bold",
+        )
+        
+        metrics_to_plot = [
+            ("cosine_similarity", "Cosine Similarity", "coolwarm", -1, 1),
+            ("l2_distance", "L2 Distance", "viridis", None, None),
+            ("sign_conflicts", "Sign Conflicts", "YlOrRd", None, None),
+            ("jaccard_similarity", "Jaccard Similarity", "RdYlGn", 0, 1),
+        ]
+        
+        for idx, (metric_key, title, cmap, vmin_fixed, vmax_fixed) in enumerate(metrics_to_plot):
+            # Original (left column)
+            ax_orig = axes[idx, 0]
+            df_orig = original_metrics[metric_key]
+            
+            vmin = vmin_fixed if vmin_fixed is not None else df_orig.min().min()
+            vmax = vmax_fixed if vmax_fixed is not None else df_orig.max().max()
+            
+            sns.heatmap(
+                df_orig,
+                annot=len(model_names) <= 10,
+                fmt=".3f",
+                cmap=cmap,
+                ax=ax_orig,
+                cbar_kws={"label": title},
+                square=True,
+                vmin=vmin,
+                vmax=vmax,
+            )
+            ax_orig.set_title(f"{title} - Original", fontsize=12, fontweight="bold")
+            ax_orig.set_xlabel("Model", fontsize=10)
+            ax_orig.set_ylabel("Model", fontsize=10)
+            
+            # Reconstructed (middle column)
+            ax_recon = axes[idx, 1]
+            df_recon = reconstructed_metrics[metric_key]
+            
+            sns.heatmap(
+                df_recon,
+                annot=len(model_names) <= 10,
+                fmt=".3f",
+                cmap=cmap,
+                ax=ax_recon,
+                cbar_kws={"label": title},
+                square=True,
+                vmin=vmin,
+                vmax=vmax,
+            )
+            ax_recon.set_title(f"{title} - Reconstructed", fontsize=12, fontweight="bold")
+            ax_recon.set_xlabel("Model", fontsize=10)
+            ax_recon.set_ylabel("Model", fontsize=10)
+            
+            # Difference (right column)
+            ax_diff = axes[idx, 2]
+            diff = df_recon.values - df_orig.values
+            
+            sns.heatmap(
+                pd.DataFrame(diff, index=df_orig.index, columns=df_orig.columns),
+                annot=len(model_names) <= 10,
+                fmt=".3f",
+                cmap="RdBu_r",
+                ax=ax_diff,
+                cbar_kws={"label": "Difference"},
+                square=True,
+                center=0,
+            )
+            ax_diff.set_title(f"{title} - Error", fontsize=12, fontweight="bold")
+            ax_diff.set_xlabel("Model", fontsize=10)
+            ax_diff.set_ylabel("Model", fontsize=10)
+            
+            # Statistics (far right column)
+            ax_stats = axes[idx, 3]
+            ax_stats.axis('off')
+            
+            # Compute statistics
+            mask = np.triu(np.ones_like(df_orig.values, dtype=bool), k=1)
+            orig_vals = df_orig.values[mask]
+            recon_vals = df_recon.values[mask]
+            
+            correlation = np.corrcoef(orig_vals, recon_vals)[0, 1]
+            mae = np.mean(np.abs(orig_vals - recon_vals))
+            rmse = np.sqrt(np.mean((orig_vals - recon_vals) ** 2))
+            max_error = np.max(np.abs(orig_vals - recon_vals))
+            
+            stats_text = f"""
+            Reconstruction Statistics:
+            
+            Correlation: {correlation:.4f}
+            MAE: {mae:.4f}
+            RMSE: {rmse:.4f}
+            Max Error: {max_error:.4f}
+            
+            Original Mean: {np.mean(orig_vals):.4f}
+            Recon Mean: {np.mean(recon_vals):.4f}
+            """
+            
+            ax_stats.text(0.1, 0.5, stats_text, fontsize=10, verticalalignment='center',
+                         fontfamily='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+        
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
     def _save_heatmap_json(
         self,
         original_metrics: Dict[str, pd.DataFrame],
         all_projected_metrics: Dict[float, Dict[str, pd.DataFrame]],
+        all_reconstructed_metrics: Dict[float, Dict[str, pd.DataFrame]],
     ):
-        """Save all heatmap data as JSON for programmatic access."""
+        """Save all heatmap data including reconstruction as JSON for programmatic access."""
         import json
         
         json_data = {
@@ -797,6 +1080,13 @@ class RandomSubspaceTaskVectorAnalysis(
                     for metric_name, df in metrics.items()
                 }
                 for proj_ratio, metrics in all_projected_metrics.items()
+            },
+            "reconstructed_spaces": {
+                f"ratio_{proj_ratio:.2f}": {
+                    metric_name: df.to_dict(orient='index')
+                    for metric_name, df in metrics.items()
+                }
+                for proj_ratio, metrics in all_reconstructed_metrics.items()
             },
             "metadata": {
                 "transform_type": self.transform_type,

@@ -10,3 +10,11 @@ defaults:
       - mnist
       - dtd
 base_model: openai/clip-vit-large-patch14
+
+# Reduce batch size for large model to prevent OOM
+dataloader_kwargs:
+  batch_size: 64  # Reduced from 128 to prevent OOM with large-patch14
+  num_workers: 8
+  pin_memory: True
+  drop_last: False
+  shuffle: False

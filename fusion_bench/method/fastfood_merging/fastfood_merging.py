@@ -141,8 +141,8 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         adaptive_proj_mode: str = "tensor",
         adaptive_proj_strategy: str = "rank",
         adaptive_proj_m_min: int = 16,
-        adaptive_proj_f_max: float = 0.5,
-        adaptive_proj_pow2: bool = True,
+        adaptive_proj_f_max: float = 1.0,
+        adaptive_proj_pow2: bool = False,
         adaptive_proj_pow2_mode: str = "ceil",
         adaptive_proj_beta: float = 2.5,
         adaptive_proj_seed: int | None = None,
@@ -236,13 +236,13 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         Also accept already-canonical names.
         """
         ss = str(s).lower()
-        if ss in {"srht", "fwht", "dct", "dht"}:
+        if ss in {"srht", "fwht", "dct", "dht", "fastfood"}:
             return ss
         if ss in {"hadamard", "wht", "had"}:
             return "srht"
         if ss in {"hadamard_full", "fwht_full"}:
             return "fwht"
-        raise ValueError(f"Unknown transform_type='{s}'. Use one of: 'srht','fwht','dct','dht' (or 'hadamard','hadamard_full').")
+        raise ValueError(f"Unknown transform_type='{s}'. Use one of: 'srht','fwht','dct','dht','fastfood' (or 'hadamard','hadamard_full').")
 
     # ------------------- helpers -------------------
     def _compute_proj_size(
@@ -259,9 +259,9 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         Args:
             param_name: Name of the parameter
             tensor: Parameter tensor
-            layer_params: Dictionary of layer parameters (for layer mode)
-            layer_idx: Current layer index (for layer_progressive strategy)
-            num_layers: Total number of layers (for layer_progressive strategy)
+            layer_params: Dictionary of layer parameters (for adaptive_proj_mode="layer")
+            layer_idx: Current layer index (for layer_progressive and layer_group strategies)
+            num_layers: Total number of layers (for layer_progressive and layer_group strategies)
         """
         if not self.use_adaptive_proj_size:
             d_last = int(tensor.shape[-1])
@@ -299,7 +299,10 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
     def _build_layer_index_map(self, keys: List[str]) -> Tuple[Dict[str, int], int]:
         """
-        Build a mapping from parameter name to layer index for layer_progressive strategy.
+        Build a mapping from parameter name to layer index.
+        
+        Used by layer_progressive and layer_group strategies to determine which 
+        layer each parameter belongs to.
         
         Returns:
             (param_to_layer_idx, num_layers) - mapping and total layer count
@@ -320,6 +323,132 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         param_to_idx = {k: layer_to_idx[_layer_key(k)] for k in keys}
         
         return param_to_idx, num_layers
+
+    def _generate_layer_projection_report(
+        self,
+        param_to_layer_idx: Dict[str, int],
+        num_layers: int,
+        keys_linear: List[str],
+        base_cpu: Dict[str, torch.Tensor],
+    ) -> Dict[str, Any]:
+        """
+        Generate a detailed report of projection sizes per layer for layer_progressive
+        and layer_group strategies.
+        
+        Args:
+            param_to_layer_idx: Mapping from parameter name to layer index
+            num_layers: Total number of layers
+            keys_linear: List of linear parameter names
+            base_cpu: Base model state dict for getting tensor shapes
+            
+        Returns:
+            Dictionary containing layer-wise projection information
+        """
+        import json
+        from pathlib import Path
+        from fusion_bench.method.fastfood_merging.projection_size_estimator import (
+            compute_layer_progressive_ratio,
+            compute_layer_group_ratio,
+        )
+        
+        report = {
+            "strategy": self.adaptive_proj_strategy,
+            "adaptive_proj_mode": self.adaptive_proj_mode,
+            "num_layers": num_layers,
+            "layers": []
+        }
+        
+        # Add strategy-specific configuration
+        if self.adaptive_proj_strategy == "layer_progressive":
+            report["config"] = {
+                "start_proj_ratio": self.proj_size_cfg.start_proj_ratio,
+                "end_proj_ratio": self.proj_size_cfg.end_proj_ratio,
+                "growth_mode": self.proj_size_cfg.growth_mode,
+            }
+        elif self.adaptive_proj_strategy == "layer_group":
+            report["config"] = {
+                "group_boundary_layer": self.proj_size_cfg.group_boundary_layer,
+                "feature_proj_ratio": self.proj_size_cfg.feature_proj_ratio,
+                "head_proj_ratio": self.proj_size_cfg.head_proj_ratio,
+            }
+        
+        # Collect layer information
+        layer_info = {}
+        for layer_idx in range(num_layers):
+            layer_info[layer_idx] = {
+                "layer_index": layer_idx,
+                "parameters": [],
+                "projection_ratios": [],
+                "projection_sizes": [],
+            }
+        
+        # Process each parameter
+        for name in keys_linear:
+            if name not in param_to_layer_idx:
+                continue
+                
+            layer_idx = param_to_layer_idx[name]
+            tb = base_cpu[name]
+            d_last = int(tb.shape[-1])
+            
+            # Compute projection size
+            if self.adaptive_proj_mode == "layer":
+                lkey = layer_key(name)
+                layer_params = self._layer_groups.get(lkey, {name: tb})
+                proj_size = self._compute_proj_size(name, tb, layer_params, layer_idx, num_layers)
+            else:
+                proj_size = self._compute_proj_size(name, tb, None, layer_idx, num_layers)
+            
+            # Compute the actual ratio used
+            proj_ratio = proj_size / d_last if d_last > 0 else 0.0
+            
+            layer_info[layer_idx]["parameters"].append({
+                "name": name,
+                "shape": list(tb.shape),
+                "d_last": d_last,
+                "proj_size": proj_size,
+                "proj_ratio": round(proj_ratio, 4),
+            })
+            layer_info[layer_idx]["projection_ratios"].append(proj_ratio)
+            layer_info[layer_idx]["projection_sizes"].append(proj_size)
+        
+        # Aggregate layer statistics
+        for layer_idx in range(num_layers):
+            info = layer_info[layer_idx]
+            
+            # Compute theoretical ratio for this layer
+            if self.adaptive_proj_strategy == "layer_progressive":
+                theoretical_ratio = compute_layer_progressive_ratio(
+                    layer_idx,
+                    num_layers,
+                    self.proj_size_cfg.start_proj_ratio,
+                    self.proj_size_cfg.end_proj_ratio,
+                    self.proj_size_cfg.growth_mode
+                )
+            elif self.adaptive_proj_strategy == "layer_group":
+                theoretical_ratio = compute_layer_group_ratio(
+                    layer_idx,
+                    self.proj_size_cfg.group_boundary_layer,
+                    self.proj_size_cfg.feature_proj_ratio,
+                    self.proj_size_cfg.head_proj_ratio
+                )
+            else:
+                theoretical_ratio = None
+            
+            if theoretical_ratio is not None:
+                info["theoretical_proj_ratio"] = round(theoretical_ratio, 4)
+            
+            # Average actual projection ratio
+            if info["projection_ratios"]:
+                info["avg_proj_ratio"] = round(
+                    sum(info["projection_ratios"]) / len(info["projection_ratios"]), 4
+                )
+                info["min_proj_size"] = min(info["projection_sizes"])
+                info["max_proj_size"] = max(info["projection_sizes"])
+            
+            report["layers"].append(info)
+        
+        return report
 
     # ------------------- main -------------------
     @torch.no_grad()
@@ -429,8 +558,8 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         if torch.is_floating_point(tv_cpu[k]) and tv_cpu[k].ndim >= 1
                     ]
 
-                    # Build layer index map for layer_progressive strategy
-                    if self.use_adaptive_proj_size and self.adaptive_proj_strategy == "layer_progressive":
+                    # Build layer index map for layer_progressive and layer_group strategies
+                    if self.use_adaptive_proj_size and self.adaptive_proj_strategy in ("layer_progressive", "layer_group"):
                         param_to_layer_idx_ta, num_layers_ta = self._build_layer_index_map(keys_float_ta)
                     else:
                         param_to_layer_idx_ta, num_layers_ta = {}, 1
@@ -704,10 +833,15 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         merged_tensors = 0
         changed_params = 0
 
-        # Build layer index map for layer_progressive strategy
-        if self.use_adaptive_proj_size and self.adaptive_proj_strategy == "layer_progressive":
-            param_to_layer_idx, num_layers = self._build_layer_index_map(keys_float)
-            print(f"[Layer Progressive] Detected {num_layers} layers for progressive sizing")
+        # Build layer index map for layer_progressive and layer_group strategies
+        # Use keys_linear when only_project_linear=True to only count projected parameters
+        if self.use_adaptive_proj_size and self.adaptive_proj_strategy in ("layer_progressive", "layer_group"):
+            layer_map_keys = keys_linear if self.only_project_linear else keys_float
+            param_to_layer_idx, num_layers = self._build_layer_index_map(layer_map_keys)
+            if self.adaptive_proj_strategy == "layer_progressive":
+                print(f"[Layer Progressive] Detected {num_layers} layers for progressive sizing")
+            else:
+                print(f"[Layer Group] Detected {num_layers} layers, boundary at layer {self.proj_size_cfg.group_boundary_layer}")
         else:
             param_to_layer_idx, num_layers = {}, 1
 
@@ -758,6 +892,18 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
                     seed_key = proj_seed_key(name)
                     cur_D = flat_dim
+                    
+                    # Compute the maximum allowed projection size based on transform type
+                    # For DCT/DHT: L = D (no padding), For FWHT/SRHT/Fastfood: L = next_pow2(D)
+                    if self.transform_type in ("dct", "dht"):
+                        max_proj_dim = cur_D
+                    else:  # fwht, srht, fastfood
+                        # Compute next power of 2
+                        max_proj_dim = 1 << (cur_D - 1).bit_length()
+                    
+                    # Clip projection dimension to not exceed the transform's capacity
+                    proj_dim = min(proj_dim, max_proj_dim)
+                    
                     cache_key = (self.transform_type, seed_key, cur_D, proj_dim)
 
                     if cache_key not in op_cache:
@@ -852,6 +998,18 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
                 seed_key = proj_seed_key(name)
                 cur_D = global_D if (global_D is not None) else d_last
+                
+                # Compute the maximum allowed projection size based on transform type
+                # For DCT/DHT: L = D (no padding), For FWHT/SRHT/Fastfood: L = next_pow2(D)
+                if self.transform_type in ("dct", "dht"):
+                    max_proj_dim = cur_D
+                else:  # fwht, srht, fastfood
+                    # Compute next power of 2
+                    max_proj_dim = 1 << (cur_D - 1).bit_length()
+                
+                # Clip projection dimension to not exceed the transform's capacity
+                proj_dim = min(proj_dim, max_proj_dim)
+                
                 cache_key = (self.transform_type, seed_key, cur_D, proj_dim)
 
                 if cache_key not in op_cache:
@@ -1002,6 +1160,70 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             print(f"   LO  {r:.3f}  {name}")
 
         self.print_profile_summary()
+
+        # ---------- Generate Layer Projection Report (for layer_progressive and layer_group) ----------
+        if self.use_adaptive_proj_size and self.adaptive_proj_strategy in ("layer_progressive", "layer_group"):
+            print("\n=== Generating Layer Projection Report ===")
+            try:
+                report = self._generate_layer_projection_report(
+                    param_to_layer_idx, num_layers, keys_linear, base_cpu
+                )
+                
+                # Save report to JSON file
+                import json
+                from pathlib import Path
+                import os
+                
+                # Determine output directory
+                if hasattr(self, 'fabric') and hasattr(self.fabric, 'loggers'):
+                    # Try to get output directory from fabric loggers
+                    output_dir = None
+                    for logger in self.fabric.loggers:
+                        if hasattr(logger, 'log_dir'):
+                            output_dir = Path(logger.log_dir)
+                            break
+                    if output_dir is None:
+                        output_dir = Path.cwd() / "outputs"
+                else:
+                    # Use current working directory or hydra output dir
+                    from omegaconf import DictConfig
+                    import hydra
+                    if hasattr(hydra, 'core') and hasattr(hydra.core, 'hydra_config') and hydra.core.hydra_config.HydraConfig.initialized():
+                        hconf = hydra.core.hydra_config.HydraConfig.get()
+                        output_dir = Path(hconf.runtime.output_dir)
+                    else:
+                        output_dir = Path.cwd() / "outputs"
+                
+                output_dir.mkdir(parents=True, exist_ok=True)
+                report_path = output_dir / "layer_projection_report.json"
+                
+                with open(report_path, 'w') as f:
+                    json.dump(report, f, indent=2)
+                
+                print(f"[Layer Projection Report] Saved to: {report_path}")
+                print(f"[Layer Projection Report] Strategy: {self.adaptive_proj_strategy}")
+                print(f"[Layer Projection Report] Number of layers: {num_layers}")
+                
+                # Print summary
+                if self.adaptive_proj_strategy == "layer_group":
+                    boundary = self.proj_size_cfg.group_boundary_layer
+                    feature_ratio = self.proj_size_cfg.feature_proj_ratio
+                    head_ratio = self.proj_size_cfg.head_proj_ratio
+                    print(f"[Layer Projection Report] Boundary: layer {boundary}")
+                    print(f"[Layer Projection Report] Feature layers (0-{boundary-1}): ratio={feature_ratio:.3f}")
+                    print(f"[Layer Projection Report] Head layers ({boundary}-{num_layers-1}): ratio={head_ratio:.3f}")
+                elif self.adaptive_proj_strategy == "layer_progressive":
+                    start_ratio = self.proj_size_cfg.start_proj_ratio
+                    end_ratio = self.proj_size_cfg.end_proj_ratio
+                    growth_mode = self.proj_size_cfg.growth_mode
+                    print(f"[Layer Projection Report] Start ratio: {start_ratio:.3f}")
+                    print(f"[Layer Projection Report] End ratio: {end_ratio:.3f}")
+                    print(f"[Layer Projection Report] Growth mode: {growth_mode}")
+                
+            except Exception as e:
+                print(f"[Layer Projection Report] Warning: Failed to generate report: {e}")
+                import traceback
+                traceback.print_exc()
 
         # ---------- Load merged state back ----------
         if isinstance(base_model, nn.Module):

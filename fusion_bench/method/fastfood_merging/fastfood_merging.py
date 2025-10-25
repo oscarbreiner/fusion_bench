@@ -152,6 +152,8 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         adaptive_proj_group_boundary: int = 5,
         adaptive_proj_feature_ratio: float = 0.3,
         adaptive_proj_head_ratio: float = 0.8,
+        adaptive_proj_global_ratio: float = 0.25,
+        adaptive_proj_power_law_alpha: float = 0.85,
         # Kept in signature for compatibility (not used)
         ties_trim_pct: float = 0.0,
         tadrop_tau: float = 0.0,
@@ -216,6 +218,8 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 group_boundary_layer=int(adaptive_proj_group_boundary),
                 feature_proj_ratio=float(adaptive_proj_feature_ratio),
                 head_proj_ratio=float(adaptive_proj_head_ratio),
+                global_ratio=float(adaptive_proj_global_ratio),
+                power_law_alpha=float(adaptive_proj_power_law_alpha),
                 rng=_random.Random(adaptive_proj_seed) if adaptive_proj_seed is not None else None,
             )
         else:
@@ -230,19 +234,23 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
     @staticmethod
     def _normalize_transform_type(s: str) -> str:
         """
-        Map user-friendly names to the canonical set {'srht','fwht','dct','dht'}.
+        Map user-friendly names to the canonical set {'srht','fwht','dct','dht','none'}.
         - 'hadamard' -> 'srht' (subsampled Hadamard sketch)
         - 'hadamard_full' -> 'fwht' (full FWHT, m must equal 2^k)
+        - 'none' -> 'none' (identity transform, no projection)
         Also accept already-canonical names.
         """
         ss = str(s).lower()
-        if ss in {"srht", "fwht", "dct", "dht", "fastfood"}:
+        if ss in {"srht", "fwht", "dct", "dht", "fastfood", "none", "identity"}:
+            # Map 'identity' to 'none' for consistency
+            if ss == "identity":
+                return "none"
             return ss
         if ss in {"hadamard", "wht", "had"}:
             return "srht"
         if ss in {"hadamard_full", "fwht_full"}:
             return "fwht"
-        raise ValueError(f"Unknown transform_type='{s}'. Use one of: 'srht','fwht','dct','dht','fastfood' (or 'hadamard','hadamard_full').")
+        raise ValueError(f"Unknown transform_type='{s}'. Use one of: 'srht','fwht','dct','dht','fastfood','none' (or 'hadamard','hadamard_full','identity').")
 
     # ------------------- helpers -------------------
     def _compute_proj_size(
@@ -252,6 +260,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         layer_params: Dict[str, torch.Tensor] | None = None,
         layer_idx: int = 0,
         num_layers: int = 1,
+        all_dims: List[int] | None = None,  # For layer_power_law strategy (DEPRECATED - now uses per-layer dims)
     ) -> int:
         """
         Compute projection size for a parameter tensor.
@@ -262,6 +271,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             layer_params: Dictionary of layer parameters (for adaptive_proj_mode="layer")
             layer_idx: Current layer index (for layer_progressive and layer_group strategies)
             num_layers: Total number of layers (for layer_progressive and layer_group strategies)
+            all_dims: List of all dimensions (DEPRECATED - for backward compatibility only)
         """
         if not self.use_adaptive_proj_size:
             d_last = int(tensor.shape[-1])
@@ -278,17 +288,28 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             mode: Mode = self.adaptive_proj_mode  # type: ignore
             strategy: Strategy = self.adaptive_proj_strategy  # type: ignore
 
+            # For layer_power_law strategy, get per-layer dimensions
+            if strategy == "layer_power_law" and hasattr(self, '_layer_dims_map'):
+                lkey = layer_key(param_name)
+                layer_all_dims = self._layer_dims_map.get(lkey, None)
+                if layer_all_dims is None:
+                    # Fallback if parameter not found in map
+                    print(f"[Warning] Parameter {param_name} not found in layer dims map, using fallback")
+                    layer_all_dims = [int(tensor.shape[-1])]
+            else:
+                layer_all_dims = all_dims  # For other strategies or backward compatibility
+
             if mode == "layer":
                 if layer_params is None:
                     raise ValueError("layer_params required for adaptive layer mode")
                 m = proj_size_for(
                     layer_params, mode="layer", strategy=strategy, cfg=self.proj_size_cfg,
-                    layer_idx=layer_idx, num_layers=num_layers
+                    layer_idx=layer_idx, num_layers=num_layers, all_dims=layer_all_dims
                 )
             else:  # tensor mode
                 m = proj_size_for(
                     tensor, mode="tensor", strategy=strategy, cfg=self.proj_size_cfg,
-                    layer_idx=layer_idx, num_layers=num_layers
+                    layer_idx=layer_idx, num_layers=num_layers, all_dims=layer_all_dims
                 )
 
             return m
@@ -392,12 +413,13 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             d_last = int(tb.shape[-1])
             
             # Compute projection size
+            all_dims = getattr(self, '_all_dims', None)
             if self.adaptive_proj_mode == "layer":
                 lkey = layer_key(name)
                 layer_params = self._layer_groups.get(lkey, {name: tb})
-                proj_size = self._compute_proj_size(name, tb, layer_params, layer_idx, num_layers)
+                proj_size = self._compute_proj_size(name, tb, layer_params, layer_idx, num_layers, all_dims)
             else:
-                proj_size = self._compute_proj_size(name, tb, None, layer_idx, num_layers)
+                proj_size = self._compute_proj_size(name, tb, None, layer_idx, num_layers, all_dims)
             
             # Compute the actual ratio used
             proj_ratio = proj_size / d_last if d_last > 0 else 0.0
@@ -449,6 +471,206 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             report["layers"].append(info)
         
         return report
+
+    def _print_layer_power_law_report(self):
+        """
+        Print a detailed report of layer power-law projection sizes showing:
+        - Per-layer budget and actual projections
+        - Per-parameter dimensions, projection sizes, and effective ratios
+        - Verification that per-layer budget is preserved
+        """
+        if not hasattr(self, '_layer_power_law_projections') or not self._layer_power_law_projections:
+            print("[Layer Power-Law] No projection data available")
+            return
+        
+        print(f"\n{'='*80}")
+        print(f"Layer Power-Law Projection Report")
+        print(f"{'='*80}")
+        print(f"Configuration:")
+        print(f"  Target per-layer ratio: {self.proj_size_cfg.global_ratio:.3f}")
+        print(f"  Power-law alpha: {self.proj_size_cfg.power_law_alpha:.3f}")
+        print(f"{'='*80}\n")
+        
+        # Sort layers for consistent output
+        sorted_layers = sorted(self._layer_power_law_projections.keys())
+        
+        total_original_dims = 0
+        total_projected_dims = 0
+        
+        for layer_idx, lkey in enumerate(sorted_layers, 1):
+            params = self._layer_power_law_projections[lkey]
+            
+            # Calculate layer statistics
+            layer_original_sum = sum(d_last for d_last, _, _ in params.values())
+            layer_projected_sum = sum(proj_dim for _, proj_dim, _ in params.values())
+            layer_budget = self.proj_size_cfg.global_ratio * layer_original_sum
+            layer_actual_ratio = layer_projected_sum / layer_original_sum if layer_original_sum > 0 else 0.0
+            
+            total_original_dims += layer_original_sum
+            total_projected_dims += layer_projected_sum
+            
+            # Print layer header
+            print(f"Layer {layer_idx}: {lkey}")
+            print(f"  Layer Budget: {self.proj_size_cfg.global_ratio:.3f} × {layer_original_sum} = {layer_budget:.0f}")
+            print(f"  Actual Total: {layer_projected_sum} (ratio: {layer_actual_ratio:.4f})")
+            print(f"  Budget Match: {'✓' if abs(layer_actual_ratio - self.proj_size_cfg.global_ratio) < 0.01 else '✗'}")
+            print(f"\n  Parameters ({len(params)}):")
+            
+            # Sort parameters by name for consistent output
+            sorted_params = sorted(params.items())
+            
+            # Find max name length for alignment
+            max_name_len = max(len(name.split('.')[-1]) for name, _ in sorted_params) if sorted_params else 10
+            
+            for param_name, (d_last, proj_dim, effective_ratio) in sorted_params:
+                param_short = param_name.split('.')[-1]  # Just the last part (e.g., "weight", "bias")
+                ratio_indicator = ""
+                if effective_ratio > self.proj_size_cfg.global_ratio + 0.02:
+                    ratio_indicator = " ↑"  # Higher compression ratio (less compressed)
+                elif effective_ratio < self.proj_size_cfg.global_ratio - 0.02:
+                    ratio_indicator = " ↓"  # Lower compression ratio (more compressed)
+                else:
+                    ratio_indicator = " ≈"  # About equal
+                
+                print(f"    {param_short:<{max_name_len}} : d={d_last:>5} → m={proj_dim:>5}  "
+                      f"(ratio={effective_ratio:.4f}{ratio_indicator})")
+            
+            print()  # Empty line between layers
+        
+        # Print overall summary
+        print(f"{'='*80}")
+        print(f"Overall Summary:")
+        print(f"  Total layers: {len(sorted_layers)}")
+        print(f"  Total original dimensions: {total_original_dims}")
+        print(f"  Total projected dimensions: {total_projected_dims}")
+        overall_ratio = total_projected_dims / total_original_dims if total_original_dims > 0 else 0.0
+        print(f"  Overall average ratio: {overall_ratio:.4f}")
+        print(f"  Target ratio: {self.proj_size_cfg.global_ratio:.3f}")
+        print(f"  Ratio difference: {abs(overall_ratio - self.proj_size_cfg.global_ratio):.4f}")
+        print(f"{'='*80}\n")
+        
+        # Legend
+        print("Legend:")
+        print("  ↑ : Parameter compressed LESS than layer average (higher ratio)")
+        print("  ↓ : Parameter compressed MORE than layer average (lower ratio)")
+        print("  ≈ : Parameter compressed about equal to layer average")
+        print()
+
+    def _generate_layer_power_law_report_data(self) -> Dict[str, Any]:
+        """
+        Generate layer power-law report data as a dictionary for JSON export.
+        
+        Returns:
+            Dictionary containing the complete report data
+        """
+        if not hasattr(self, '_layer_power_law_projections') or not self._layer_power_law_projections:
+            return {"error": "No projection data available"}
+        
+        report = {
+            "configuration": {
+                "target_per_layer_ratio": float(self.proj_size_cfg.global_ratio),
+                "power_law_alpha": float(self.proj_size_cfg.power_law_alpha),
+            },
+            "layers": [],
+            "overall_summary": {}
+        }
+        
+        # Sort layers for consistent output
+        sorted_layers = sorted(self._layer_power_law_projections.keys())
+        
+        total_original_dims = 0
+        total_projected_dims = 0
+        
+        for lkey in sorted_layers:
+            params = self._layer_power_law_projections[lkey]
+            
+            # Calculate layer statistics
+            layer_original_sum = sum(d_last for d_last, _, _ in params.values())
+            layer_projected_sum = sum(proj_dim for _, proj_dim, _ in params.values())
+            layer_budget = self.proj_size_cfg.global_ratio * layer_original_sum
+            layer_actual_ratio = layer_projected_sum / layer_original_sum if layer_original_sum > 0 else 0.0
+            
+            total_original_dims += layer_original_sum
+            total_projected_dims += layer_projected_sum
+            
+            # Build layer data
+            layer_data = {
+                "layer_key": lkey,
+                "budget": {
+                    "target_ratio": float(self.proj_size_cfg.global_ratio),
+                    "original_dims_sum": int(layer_original_sum),
+                    "budget_projection_size": float(layer_budget),
+                    "actual_projection_size": int(layer_projected_sum),
+                    "actual_ratio": float(layer_actual_ratio),
+                    "budget_match": abs(layer_actual_ratio - self.proj_size_cfg.global_ratio) < 0.01
+                },
+                "parameters": []
+            }
+            
+            # Sort parameters by name for consistent output
+            sorted_params = sorted(params.items())
+            
+            for param_name, (d_last, proj_dim, effective_ratio) in sorted_params:
+                ratio_indicator = ""
+                if effective_ratio > self.proj_size_cfg.global_ratio + 0.02:
+                    ratio_indicator = "higher"  # Higher compression ratio (less compressed)
+                elif effective_ratio < self.proj_size_cfg.global_ratio - 0.02:
+                    ratio_indicator = "lower"  # Lower compression ratio (more compressed)
+                else:
+                    ratio_indicator = "equal"  # About equal
+                
+                param_data = {
+                    "name": param_name,
+                    "original_dim": int(d_last),
+                    "projection_dim": int(proj_dim),
+                    "effective_ratio": float(effective_ratio),
+                    "compression_indicator": ratio_indicator
+                }
+                layer_data["parameters"].append(param_data)
+            
+            report["layers"].append(layer_data)
+        
+        # Add overall summary
+        overall_ratio = total_projected_dims / total_original_dims if total_original_dims > 0 else 0.0
+        report["overall_summary"] = {
+            "total_layers": len(sorted_layers),
+            "total_original_dimensions": int(total_original_dims),
+            "total_projected_dimensions": int(total_projected_dims),
+            "overall_average_ratio": float(overall_ratio),
+            "target_ratio": float(self.proj_size_cfg.global_ratio),
+            "ratio_difference": float(abs(overall_ratio - self.proj_size_cfg.global_ratio))
+        }
+        
+        return report
+
+    def _get_output_directory(self) -> Path:
+        """
+        Determine the output directory for saving reports.
+        Tries fabric loggers, hydra config, then falls back to ./outputs
+        
+        Returns:
+            Path to output directory
+        """
+        from pathlib import Path
+        
+        # Try to get output directory from fabric loggers
+        if hasattr(self, 'fabric') and hasattr(self.fabric, 'loggers'):
+            for logger in self.fabric.loggers:
+                if hasattr(logger, 'log_dir'):
+                    return Path(logger.log_dir)
+        
+        # Try hydra output directory
+        try:
+            from omegaconf import DictConfig
+            import hydra
+            if hasattr(hydra, 'core') and hasattr(hydra.core, 'hydra_config') and hydra.core.hydra_config.HydraConfig.initialized():
+                hconf = hydra.core.hydra_config.HydraConfig.get()
+                return Path(hconf.runtime.output_dir)
+        except:
+            pass
+        
+        # Fallback to current directory
+        return Path.cwd() / "outputs"
 
     # ------------------- main -------------------
     @torch.no_grad()
@@ -600,15 +822,16 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         # Compute projection size (adaptive or fixed)
                         if self.use_adaptive_proj_size:
                             layer_idx_ta = param_to_layer_idx_ta.get(name, 0)
+                            all_dims = getattr(self, '_all_dims', None)
                             if self.adaptive_proj_mode == "layer":
                                 lkey = layer_key(name)
                                 layer_params_ta = {k: tv_cpu[k] for k in keys_float_ta if layer_key(k) == lkey}
                                 proj_dim = self._compute_proj_size(
-                                    name, tb, layer_params_ta, layer_idx_ta, num_layers_ta
+                                    name, tb, layer_params_ta, layer_idx_ta, num_layers_ta, all_dims
                                 )
                             else:
                                 proj_dim = self._compute_proj_size(
-                                    name, tb, None, layer_idx_ta, num_layers_ta
+                                    name, tb, None, layer_idx_ta, num_layers_ta, all_dims
                                 )
                         else:
                             proj_dim = max(1, int(cur_D * self.proj_ratio))
@@ -833,14 +1056,45 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         merged_tensors = 0
         changed_params = 0
 
-        # Build layer index map for layer_progressive and layer_group strategies
+        # Build layer index map for layer_progressive, layer_group, and layer_power_law strategies
         # Use keys_linear when only_project_linear=True to only count projected parameters
-        if self.use_adaptive_proj_size and self.adaptive_proj_strategy in ("layer_progressive", "layer_group"):
+        if self.use_adaptive_proj_size and self.adaptive_proj_strategy in ("layer_progressive", "layer_group", "layer_power_law"):
             layer_map_keys = keys_linear if self.only_project_linear else keys_float
-            param_to_layer_idx, num_layers = self._build_layer_index_map(layer_map_keys)
+            
+            # For layer_power_law, group parameters by layer and collect dimensions per layer
+            if self.adaptive_proj_strategy == "layer_power_law":
+                from .projection_size_estimator import last_dim_from_tensor
+                
+                # Group parameters by layer
+                self._layer_dims_map: Dict[str, List[int]] = {}
+                for k in layer_map_keys:
+                    if k in base_cpu:
+                        lkey = layer_key(k)
+                        if lkey not in self._layer_dims_map:
+                            self._layer_dims_map[lkey] = []
+                        self._layer_dims_map[lkey].append(last_dim_from_tensor(base_cpu[k]))
+                
+                # Print summary
+                total_params = sum(len(dims) for dims in self._layer_dims_map.values())
+                total_dim_sum = sum(sum(dims) for dims in self._layer_dims_map.values())
+                print(f"[Layer Power-Law] Grouped {total_params} parameters into {len(self._layer_dims_map)} layers")
+                print(f"[Layer Power-Law] Total dimension sum: {total_dim_sum}, per-layer budget ratio: {self.proj_size_cfg.global_ratio:.2f}")
+                print(f"[Layer Power-Law] Power-law alpha: {self.proj_size_cfg.power_law_alpha:.2f}")
+                
+                # Initialize projection tracking for detailed report
+                self._layer_power_law_projections: Dict[str, Dict[str, Tuple[int, int, float]]] = {}
+                
+                param_to_layer_idx, num_layers = {}, 1  # Not used for layer_power_law
+                self._all_dims = None  # Not used anymore
+            elif self.adaptive_proj_strategy in ("layer_progressive", "layer_group"):
+                param_to_layer_idx, num_layers = self._build_layer_index_map(layer_map_keys)
+                self._layer_dims_map = None
+            else:
+                param_to_layer_idx, num_layers = {}, 1
+                self._layer_dims_map = None
             if self.adaptive_proj_strategy == "layer_progressive":
                 print(f"[Layer Progressive] Detected {num_layers} layers for progressive sizing")
-            else:
+            elif self.adaptive_proj_strategy == "layer_group":
                 print(f"[Layer Group] Detected {num_layers} layers, boundary at layer {self.proj_size_cfg.group_boundary_layer}")
         else:
             param_to_layer_idx, num_layers = {}, 1
@@ -883,12 +1137,13 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     vb_flat = tb.view(-1).float()
 
                     layer_idx = param_to_layer_idx.get(name, 0)
+                    all_dims = getattr(self, '_all_dims', None)
                     if self.use_adaptive_proj_size and self.adaptive_proj_mode == "layer":
                         lkey = layer_key(name)
                         layer_params = self._layer_groups.get(lkey, {name: tb})
-                        proj_dim = self._compute_proj_size(name, tb, layer_params, layer_idx, num_layers)
+                        proj_dim = self._compute_proj_size(name, tb, layer_params, layer_idx, num_layers, all_dims)
                     else:
-                        proj_dim = self._compute_proj_size(name, tb, None, layer_idx, num_layers)
+                        proj_dim = self._compute_proj_size(name, tb, None, layer_idx, num_layers, all_dims)
 
                     seed_key = proj_seed_key(name)
                     cur_D = flat_dim
@@ -903,6 +1158,14 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     
                     # Clip projection dimension to not exceed the transform's capacity
                     proj_dim = min(proj_dim, max_proj_dim)
+                    
+                    # Track projection for layer_power_law reporting
+                    if self.adaptive_proj_strategy == "layer_power_law" and hasattr(self, '_layer_power_law_projections'):
+                        lkey = layer_key(name)
+                        if lkey not in self._layer_power_law_projections:
+                            self._layer_power_law_projections[lkey] = {}
+                        effective_ratio = proj_dim / d_last if d_last > 0 else 0.0
+                        self._layer_power_law_projections[lkey][name] = (d_last, proj_dim, effective_ratio)
                     
                     cache_key = (self.transform_type, seed_key, cur_D, proj_dim)
 
@@ -989,12 +1252,13 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 br = min(self.block_rows, rows)
 
                 layer_idx = param_to_layer_idx.get(name, 0)
+                all_dims = getattr(self, '_all_dims', None)
                 if self.use_adaptive_proj_size and self.adaptive_proj_mode == "layer":
                     lkey = layer_key(name)
                     layer_params = self._layer_groups.get(lkey, {name: tb})
-                    proj_dim = self._compute_proj_size(name, tb, layer_params, layer_idx, num_layers)
+                    proj_dim = self._compute_proj_size(name, tb, layer_params, layer_idx, num_layers, all_dims)
                 else:
-                    proj_dim = self._compute_proj_size(name, tb, None, layer_idx, num_layers)
+                    proj_dim = self._compute_proj_size(name, tb, None, layer_idx, num_layers, all_dims)
 
                 seed_key = proj_seed_key(name)
                 cur_D = global_D if (global_D is not None) else d_last
@@ -1009,6 +1273,14 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 
                 # Clip projection dimension to not exceed the transform's capacity
                 proj_dim = min(proj_dim, max_proj_dim)
+                
+                # Track projection for layer_power_law reporting
+                if self.adaptive_proj_strategy == "layer_power_law" and hasattr(self, '_layer_power_law_projections'):
+                    lkey = layer_key(name)
+                    if lkey not in self._layer_power_law_projections:
+                        self._layer_power_law_projections[lkey] = {}
+                    effective_ratio = proj_dim / d_last if d_last > 0 else 0.0
+                    self._layer_power_law_projections[lkey][name] = (d_last, proj_dim, effective_ratio)
                 
                 cache_key = (self.transform_type, seed_key, cur_D, proj_dim)
 
@@ -1160,6 +1432,30 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             print(f"   LO  {r:.3f}  {name}")
 
         self.print_profile_summary()
+
+        # ---------- Generate Layer Power-Law Projection Report ----------
+        if self.use_adaptive_proj_size and self.adaptive_proj_strategy == "layer_power_law" and hasattr(self, '_layer_power_law_projections'):
+            print("\n=== Layer Power-Law Projection Report ===")
+            self._print_layer_power_law_report()
+            
+            # Save report to JSON file
+            try:
+                report_data = self._generate_layer_power_law_report_data()
+                
+                import json
+                from pathlib import Path
+                
+                # Determine output directory
+                output_dir = self._get_output_directory()
+                output_dir.mkdir(parents=True, exist_ok=True)
+                
+                report_path = output_dir / "layer_power_law_report.json"
+                with open(report_path, 'w') as f:
+                    json.dump(report_data, f, indent=2)
+                
+                print(f"[Layer Power-Law] Report saved to: {report_path}")
+            except Exception as e:
+                print(f"[Layer Power-Law] Warning: Could not save report to file: {e}")
 
         # ---------- Generate Layer Projection Report (for layer_progressive and layer_group) ----------
         if self.use_adaptive_proj_size and self.adaptive_proj_strategy in ("layer_progressive", "layer_group"):

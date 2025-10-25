@@ -32,12 +32,13 @@ use_adaptive_proj_size: false # Enable adaptive projection size estimation
 adaptive_proj_mode: "tensor"  # "tensor" | "layer" (scope for rank estimation and projection size computation)
                               # - tensor: per-tensor projection size (uses individual tensor dimensions)
                               # - layer: per-layer projection size (uses max dimension across layer tensors)
-adaptive_proj_strategy: "rank" # "fixed" | "random" | "rank" | "layer_progressive" | "layer_group"
+adaptive_proj_strategy: "rank" # "fixed" | "random" | "rank" | "layer_progressive" | "layer_group" | "layer_power_law"
                               # - fixed: m = ratio * d_last
                               # - random: m ~ U[m_min, f_max * d_last]
                               # - rank: m = beta * estimated_rank
                               # - layer_progressive: gradual scaling from start_ratio to end_ratio across layers
                               # - layer_group: fixed ratio per group (feature extraction vs head)
+                              # - layer_power_law: power-law redistribution with global budget (B = global_ratio * sum(dims))
 adaptive_proj_m_min: 64       # Minimum projection size
 adaptive_proj_f_max: 1.0      # Maximum fraction of d_last
 adaptive_proj_pow2: false      # Round to power-of-2
@@ -63,6 +64,16 @@ adaptive_proj_head_ratio: 0.8      # FIXED projection ratio for head layers (0.0
                                # Note: These are FIXED ratios per group, not adaptive
                                # Final projection size: m = group_ratio * d_last
                                # Compatible with ALL adaptive_proj_mode and subspace_scope settings
+
+# Global Power-Law Strategy Parameters (for adaptive_proj_strategy="global_power_law")
+adaptive_proj_global_ratio: 0.25   # Overall compression budget (average ratio across all layers, 0.0-1.0)
+                               # This maintains a global projection capacity budget B = global_ratio * sum(all_dims)
+adaptive_proj_power_law_alpha: 0.85 # Power-law exponent for dimension-aware redistribution (0.7-0.95 typical)
+                               # alpha < 1: Larger layers compressed more, smaller layers less (default: 0.85)
+                               # alpha = 1: Uniform ratio (equivalent to fixed strategy)
+                               # alpha > 1: Larger layers compressed less, smaller layers more
+                               # Formula: m_i = B * (d_i^alpha) / sum(d_j^alpha)
+                               # This ensures average compression = global_ratio while adapting to layer sizes
 
 # ============================================================================
 # Weight Matching Preprocessing (Optional - Git Re-Basin)

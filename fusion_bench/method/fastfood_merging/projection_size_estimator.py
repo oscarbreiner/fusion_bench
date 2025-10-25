@@ -7,7 +7,7 @@ Supports two modes:
   - tensor: Per-tensor projection size estimation
   - layer: Per-layer projection size estimation (shared across layer's parameters)
 
-Four strategies:
+Five strategies:
   - fixed: m = ratio * d_last
   - random: m ~ U[m_min, f_max * d_last]
   - rank: m = beta * estimated_rank
@@ -18,6 +18,11 @@ Four strategies:
     - Linear growth: m(t) = start + t * (end - start)
     - Exponential growth: m(t) = start * (end/start)^t
     - where t = layer_idx / (num_layers - 1) ∈ [0,1]
+  - layer_group: Split network into feature extraction vs head with different ratios
+    - Requires layer_idx and boundary_layer
+  - layer_power_law: Power-law redistribution within each layer
+    - Operates PER-LAYER: Groups parameters by layer, applies power-law budget within each layer
+    - Formula: m_i = B * (d_i^alpha) / sum(d_j^alpha) where B = global_ratio * sum(d_j in layer)
 
 Usage Example:
     >>> from projection_size_estimator import ProjSizeCfg, proj_size_for
@@ -36,6 +41,12 @@ Usage Example:
     >>> cfg_progressive = ProjSizeCfg(start_proj_size=64, end_proj_size=512, growth_mode="linear")
     >>> m = proj_size_for(weight, mode="tensor", strategy="layer_progressive", 
     ...                   cfg=cfg_progressive, layer_idx=5, num_layers=12)
+    >>> 
+    >>> # Layer power-law strategy (per-layer budget)
+    >>> cfg_power = ProjSizeCfg(global_ratio=0.25, power_law_alpha=0.85)
+    >>> layer_dims = [256, 512, 1024]  # Dimensions of tensors in THIS LAYER
+    >>> m = proj_size_for(weight, mode="tensor", strategy="layer_power_law",
+    ...                   cfg=cfg_power, all_dims=layer_dims)
 """
 
 from __future__ import annotations
@@ -52,8 +63,9 @@ import math
 import torch
 
 Mode = Literal["tensor", "layer"]
-Strategy = Literal["fixed", "random", "rank", "layer_progressive", "layer_group"]
+Strategy = Literal["fixed", "random", "rank", "layer_progressive", "layer_group", "layer_power_law"]
 Pow2Mode = Literal["ceil", "floor", "nearest"]
+GrowthMode = Literal["ceil", "floor", "nearest"]
 GrowthMode = Literal["linear", "exponential"]
 
 
@@ -97,6 +109,13 @@ class ProjSizeCfg:
     group_boundary_layer: int = 5  # Layer index separating feature extraction from head
     feature_proj_ratio: float = 0.3  # Projection ratio for feature extraction layers
     head_proj_ratio: float = 0.8  # Projection ratio for head layers
+    
+    # Global power-law strategy parameters
+    global_ratio: float = 0.25     # Overall compression budget (average ratio across all layers)
+    power_law_alpha: float = 0.85  # Power-law exponent for dimension-aware redistribution
+                                   # alpha < 1: larger layers compressed more, smaller layers less
+                                   # alpha = 1: uniform ratio (equivalent to fixed strategy)
+                                   # alpha > 1: larger layers compressed less, smaller layers more
     
     rng: Optional[random.Random] = None
 
@@ -268,6 +287,96 @@ def compute_layer_group_ratio(
         return float(feature_ratio)
     else:
         return float(head_ratio)
+
+
+# ============================================================================
+# Layer Power-Law Projection Size Computation
+# ============================================================================
+
+def compute_layer_power_law_size(
+    d_i: int,
+    all_dims: List[int],
+    global_ratio: float,
+    alpha: float
+) -> int:
+    """
+    Compute projection size using power-law redistribution of budget within a layer.
+    
+    This function operates PER-LAYER: The budget is calculated for all tensors 
+    within the same layer, then redistributed using a power-law formula.
+    
+    This strategy maintains a per-layer compression budget (global_ratio) while
+    adapting per-tensor projection sizes based on their relative dimension using
+    a power-law distribution.
+    
+    Formula:
+        B = global_ratio * sum(all_dims)  # Total projection budget FOR THIS LAYER
+        weight_i = d_i ** alpha
+        m_i = B * weight_i / sum(weight_j)
+    
+    Where:
+        - B: Total projection capacity budget FOR THIS LAYER
+        - d_i: Dimension of current tensor
+        - all_dims: List of dimensions of ALL tensors IN THE SAME LAYER
+        - alpha: Power-law exponent controlling redistribution
+          * alpha < 1: Larger tensors compressed more, smaller tensors less (default: 0.85)
+          * alpha = 1: Uniform ratio (equivalent to fixed strategy)
+          * alpha > 1: Larger tensors compressed less, smaller tensors more
+    
+    This ensures:
+        1. Average compression = global_ratio (per-layer budget preserved)
+        2. Larger tensors within a layer get more absolute capacity but lower ratio
+        3. Smaller tensors within a layer get less absolute capacity but higher ratio
+    
+    Args:
+        d_i: Dimension of current parameter (d_last)
+        all_dims: List of dimensions of all tensors IN THE SAME LAYER
+        global_ratio: Per-layer compression budget (0.0-1.0, e.g., 0.25 for 25% average compression)
+        alpha: Power-law exponent (typically 0.7-0.95, default 0.85)
+        
+    Returns:
+        Projection size m_i for the current parameter
+        
+    Examples:
+        >>> # Three tensors in ONE LAYER with dims [256, 512, 1024], global_ratio=0.25, alpha=0.85
+        >>> all_dims = [256, 512, 1024]
+        >>> # Total budget for this layer: B = 0.25 * (256 + 512 + 1024) = 448
+        >>> # Weights: 256^0.85=164, 512^0.85=311, 1024^0.85=590
+        >>> # Sum weights: 1065
+        >>> # Tensor 0: m_0 = 448 * 164/1065 = 69  → ratio=69/256=0.27 (higher than 0.25)
+        >>> # Tensor 1: m_1 = 448 * 311/1065 = 131 → ratio=131/512=0.26
+        >>> # Tensor 2: m_2 = 448 * 590/1065 = 248 → ratio=248/1024=0.24 (lower than 0.25)
+        >>> compute_layer_power_law_size(256, all_dims, 0.25, 0.85)
+        69
+        >>> compute_layer_power_law_size(1024, all_dims, 0.25, 0.85)
+        248
+        
+        >>> # With alpha=1.0 (uniform ratio, equivalent to fixed strategy)
+        >>> compute_layer_power_law_size(256, all_dims, 0.25, 1.0)
+        64
+        >>> compute_layer_power_law_size(1024, all_dims, 0.25, 1.0)
+        256
+    """
+    if not all_dims or d_i <= 0:
+        return 1
+    
+    # Total projection budget
+    total_dim = sum(all_dims)
+    B = global_ratio * total_dim
+    
+    # Compute power-law weights
+    weights = [d ** alpha for d in all_dims]
+    total_weight = sum(weights)
+    
+    if total_weight < 1e-12:
+        # Fallback to uniform distribution
+        return max(1, int(B * d_i / total_dim))
+    
+    # Compute projection size for current dimension
+    weight_i = d_i ** alpha
+    m_i = B * weight_i / total_weight
+    
+    return max(1, int(m_i))
 
 
 # ============================================================================
@@ -489,17 +598,19 @@ def proj_size_for_tensor(
     strategy: Strategy,
     cfg: ProjSizeCfg,
     layer_idx: int = 0,
-    num_layers: int = 1
+    num_layers: int = 1,
+    all_dims: List[int] | None = None  # For layer_power_law strategy
 ) -> int:
     """
     Compute projection size for a single tensor.
     
     Args:
         W: Parameter tensor
-        strategy: "fixed", "random", "rank", or "layer_progressive"
+        strategy: "fixed", "random", "rank", "layer_progressive", "layer_group", or "layer_power_law"
         cfg: Configuration for projection size estimation
-        layer_idx: Current layer index (for layer_progressive strategy)
-        num_layers: Total number of layers (for layer_progressive strategy)
+        layer_idx: Current layer index (for layer_progressive/layer_group strategies)
+        num_layers: Total number of layers (for layer_progressive/layer_group strategies)
+        all_dims: List of all dimensions (for layer_power_law strategy)
         
     Returns:
         Projection size m
@@ -527,6 +638,13 @@ def proj_size_for_tensor(
             layer_idx, cfg.group_boundary_layer, cfg.feature_proj_ratio, cfg.head_proj_ratio
         )
         m_tgt = int(group_ratio * d_last)
+    elif strategy == "layer_power_law":
+        # Compute power-law redistributed size based on global budget
+        if all_dims is None:
+            raise ValueError("layer_power_law strategy requires all_dims parameter")
+        m_tgt = compute_layer_power_law_size(
+            d_last, all_dims, cfg.global_ratio, cfg.power_law_alpha
+        )
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
     
@@ -538,7 +656,8 @@ def proj_size_for_layer(
     strategy: Strategy,
     cfg: ProjSizeCfg,
     layer_idx: int = 0,
-    num_layers: int = 1
+    num_layers: int = 1,
+    all_dims: List[int] | None = None  # For layer_power_law strategy
 ) -> int:
     """
     Compute a single projection size for an entire layer group.
@@ -547,10 +666,11 @@ def proj_size_for_layer(
     
     Args:
         layer_params: Dictionary of parameter name -> tensor for a layer
-        strategy: "fixed", "random", "rank", or "layer_progressive"
+        strategy: "fixed", "random", "rank", "layer_progressive", "layer_group", or "layer_power_law"
         cfg: Configuration for projection size estimation
-        layer_idx: Current layer index (for layer_progressive strategy)
-        num_layers: Total number of layers (for layer_progressive strategy)
+        layer_idx: Current layer index (for layer_progressive/layer_group strategies)
+        num_layers: Total number of layers (for layer_progressive/layer_group strategies)
+        all_dims: List of all dimensions (for layer_power_law strategy)
         
     Returns:
         Projection size m (shared across layer)
@@ -589,6 +709,13 @@ def proj_size_for_layer(
             layer_idx, cfg.group_boundary_layer, cfg.feature_proj_ratio, cfg.head_proj_ratio
         )
         m_tgt = int(group_ratio * d_last)
+    elif strategy == "layer_power_law":
+        # Compute power-law redistributed size based on global budget
+        if all_dims is None:
+            raise ValueError("layer_power_law strategy requires all_dims parameter")
+        m_tgt = compute_layer_power_law_size(
+            d_last, all_dims, cfg.global_ratio, cfg.power_law_alpha
+        )
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
     
@@ -605,7 +732,8 @@ def proj_size_for(
     strategy: Strategy,
     cfg: ProjSizeCfg,
     layer_idx: int = 0,
-    num_layers: int = 1
+    num_layers: int = 1,
+    all_dims: List[int] | None = None  # For layer_power_law strategy
 ) -> int:
     """
     Unified entry point for projection size estimation.
@@ -613,10 +741,11 @@ def proj_size_for(
     Args:
         unit: Either a single tensor (mode="tensor") or dict of tensors (mode="layer")
         mode: "tensor" or "layer"
-        strategy: "fixed", "random", "rank", or "layer_progressive"
+        strategy: "fixed", "random", "rank", "layer_progressive", "layer_group", or "layer_power_law"
         cfg: Configuration for projection size estimation
-        layer_idx: Current layer index (for layer_progressive strategy)
-        num_layers: Total number of layers (for layer_progressive strategy)
+        layer_idx: Current layer index (for layer_progressive/layer_group strategies)
+        num_layers: Total number of layers (for layer_progressive/layer_group strategies)
+        all_dims: List of all dimensions (for layer_power_law strategy)
         
     Returns:
         Projection size m
@@ -634,19 +763,20 @@ def proj_size_for(
         >>> m = proj_size_for(layer, mode="layer", strategy="rank", cfg=cfg)
         >>> print(f"Layer projection size: {m}")
         >>> 
-        >>> # Layer progressive strategy
-        >>> m = proj_size_for(weight, mode="tensor", strategy="layer_progressive", 
-        ...                   cfg=cfg, layer_idx=5, num_layers=12)
-        >>> print(f"Progressive projection size at layer 5/12: {m}")
+        >>> # Global power-law strategy
+        >>> all_layer_dims = [256, 512, 768, 1024]
+        >>> m = proj_size_for(weight, mode="tensor", strategy="layer_power_law", 
+        ...                   cfg=cfg, all_dims=all_layer_dims)
+        >>> print(f"Power-law projection size: {m}")
     """
     if mode == "tensor":
         if not isinstance(unit, torch.Tensor):
             raise TypeError("tensor mode expects a single torch.Tensor")
-        return proj_size_for_tensor(unit, strategy, cfg, layer_idx, num_layers)
+        return proj_size_for_tensor(unit, strategy, cfg, layer_idx, num_layers, all_dims)
     elif mode == "layer":
         if not isinstance(unit, dict):
             raise TypeError("layer mode expects Dict[str, torch.Tensor]")
-        return proj_size_for_layer(unit, strategy, cfg, layer_idx, num_layers)
+        return proj_size_for_layer(unit, strategy, cfg, layer_idx, num_layers, all_dims)
     else:
         raise ValueError(f"Unknown mode: {mode}. Expected 'tensor' or 'layer'")
 

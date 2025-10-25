@@ -675,12 +675,10 @@ def zero_aware_aggregate(
         return odm_ema_tuning_free(U)
 
     if mf == "sum":
-        if weights is None:
-            return U.sum(dim=0)
-        w = torch.tensor(weights, dtype=U.dtype, device=U.device).view(
-            K, *([1] * (U.ndim - 1))
-        )
-        return (w * U).sum(dim=0)
+        # Sum should NOT use normalized weights - just sum the task vectors directly
+        # This is the key difference from 'mean': sum adds all task vectors,
+        # while mean computes the weighted average
+        return U.sum(dim=0)
 
     mask = (U != 0)
     if mf == "mean":

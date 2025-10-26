@@ -136,6 +136,8 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         analysis_output_path: str = None,
         # TSV-style linear/non-linear separation
         only_project_linear: bool = False,
+        # Embedding layer projection control
+        project_embeddings: bool = True,
         # Adaptive projection size estimation
         use_adaptive_proj_size: bool = False,
         adaptive_proj_mode: str = "tensor",
@@ -197,6 +199,9 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         # TSV-style linear/non-linear separation
         self.only_project_linear = bool(only_project_linear)
 
+        # Embedding layer projection control
+        self.project_embeddings = bool(project_embeddings)
+
         # Adaptive projection size estimation
         self.use_adaptive_proj_size = bool(use_adaptive_proj_size)
         self.adaptive_proj_mode = str(adaptive_proj_mode)
@@ -253,6 +258,41 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         raise ValueError(f"Unknown transform_type='{s}'. Use one of: 'srht','fwht','dct','dht','fastfood','none' (or 'hadamard','hadamard_full','identity').")
 
     # ------------------- helpers -------------------
+    @staticmethod
+    def _is_embedding_layer(name: str) -> bool:
+        """
+        Check if a parameter name corresponds to an embedding layer.
+        
+        Embedding layers typically include:
+        - position_embedding, pos_embed, positional_embedding
+        - patch_embed, patch_embedding
+        - token_embedding, word_embedding
+        - cls_token, class_token
+        
+        Args:
+            name: Parameter name
+            
+        Returns:
+            True if parameter is an embedding layer
+        """
+        name_lower = name.lower()
+        embedding_patterns = [
+            'position_embedding',
+            'pos_embed',
+            'positional_embedding',
+            'patch_embed',
+            'patch_embedding',
+            'token_embedding',
+            'word_embedding',
+            'cls_token',
+            'class_token',
+            'mask_token',
+            'decoder_embed',
+            'text_projection',
+            'embeddings.weight',  # Generic embedding weight
+        ]
+        return any(pattern in name_lower for pattern in embedding_patterns)
+
     def _compute_proj_size(
         self,
         param_name: str,
@@ -774,11 +814,22 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     total_norm = 0.0
                     reconstruction_errors: List[Tuple[str, float]] = []
 
+                    # Separate keys into embedding and non-embedding layers
                     keys_float_ta = [
                         k
                         for k in tv_cpu.keys()
                         if torch.is_floating_point(tv_cpu[k]) and tv_cpu[k].ndim >= 1
                     ]
+                    
+                    # Filter out embedding layers if project_embeddings=False
+                    if not self.project_embeddings:
+                        keys_embedding_ta = [k for k in keys_float_ta if self._is_embedding_layer(k)]
+                        keys_float_ta = [k for k in keys_float_ta if not self._is_embedding_layer(k)]
+                        if keys_embedding_ta:
+                            print(f"[Task Arithmetic] Excluding {len(keys_embedding_ta)} embedding layers from projection")
+                            print(f"[Task Arithmetic] Embedding layers (merged in original space): {keys_embedding_ta[:3]}{'...' if len(keys_embedding_ta) > 3 else ''}")
+                    else:
+                        keys_embedding_ta = []
 
                     # Build layer index map for layer_progressive and layer_group strategies
                     if self.use_adaptive_proj_size and self.adaptive_proj_strategy in ("layer_progressive", "layer_group"):
@@ -947,6 +998,15 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         else:
             keys_linear = keys_float
             keys_nonlinear = []
+        
+        # Filter out embedding layers if project_embeddings=False
+        if not self.project_embeddings:
+            keys_embedding = [k for k in keys_linear if self._is_embedding_layer(k)]
+            keys_linear = [k for k in keys_linear if not self._is_embedding_layer(k)]
+            keys_nonlinear.extend(keys_embedding)
+            if keys_embedding:
+                print(f"[project_embeddings=False] Excluding {len(keys_embedding)} embedding layers from projection")
+                print(f"[project_embeddings=False] Embedding layers (merged in original space): {keys_embedding[:3]}{'...' if len(keys_embedding) > 3 else ''}")
 
         K = len(donor_names)
         print(

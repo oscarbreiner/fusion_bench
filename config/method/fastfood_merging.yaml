@@ -39,7 +39,7 @@ adaptive_proj_strategy: "rank" # "fixed" | "random" | "rank" | "layer_progressiv
                               # - layer_progressive: gradual scaling from start_ratio to end_ratio across layers
                               # - layer_group: fixed ratio per group (feature extraction vs head)
                               # - layer_power_law: power-law redistribution with global budget (B = global_ratio * sum(dims))
-adaptive_proj_m_min: 64       # Minimum projection size
+adaptive_proj_m_min: 8       # Minimum projection size
 adaptive_proj_f_max: 1.0      # Maximum fraction of d_last
 adaptive_proj_pow2: false      # Round to power-of-2
 adaptive_proj_pow2_mode: "ceil" # "ceil" | "floor" | "nearest"
@@ -139,6 +139,18 @@ tadrop_tau: 0.0               # Task Arithmetic dropout threshold
 # ============================================================================
 only_project_linear: false    # If true, only 2D tensors are projected; 1D tensors merged with mean in original space
                               # This mimics TSV behavior: linear layers (weights) use subspace, non-linear (biases, norms) use mean
+
+# ============================================================================
+# Embedding Layer Control
+# ============================================================================
+project_embeddings: true      # If false, embedding layers are excluded from projection and merged in original space
+                              # Embedding layers are detected by name patterns: position_embedding, pos_embed, patch_embed, 
+                              # token_embedding, cls_token, mask_token, decoder_embed, text_projection, etc.
+                              # Use case: Embeddings often have distinct representations that may not benefit from projection
+                              # This parameter is complementary to only_project_linear
+                              # - only_project_linear=false + project_embeddings=false: Embeddings merged in original space
+                              # - only_project_linear=true + project_embeddings=false: Embeddings merged in original space (if 2D)
+                              # Default: true (all layers projected, maintains backward compatibility)
 
 # ============================================================================
 # Post-processing Options

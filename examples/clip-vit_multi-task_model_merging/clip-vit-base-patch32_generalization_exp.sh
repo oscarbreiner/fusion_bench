@@ -62,11 +62,9 @@ fusion_bench \
 
 fusion_bench \
     method=adamerging/clip \
-    method.name=clip_layer_wise_adamerging \
-    method.save_merging_weights=outputs/clip-vit-base-patch32_generalization_exp2_layer_wise_adamerging_weights.pt \
-    modelpool=clip-vit-base-patch32_generalization_exp2 \
+    modelpool=clip-vit-large-patch14_TA8 \
     taskpool=clip-vit-classification_TA8 \
-    report_save_path=outputs/clip-vit-base-patch32_generalization_exp2_clip_layer_wise_adamerging.json
+    report_save_path=outputs/clip-vit-large-patch14_TA8_adamerging.json
 
 # WEMOE
 fusion_bench \

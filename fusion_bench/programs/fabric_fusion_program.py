@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Union  # noqa: F401
 
@@ -266,6 +267,23 @@ class FabricModelFusionProgram(
         self.method.on_run_start()
         merged_model = self.method.run(self.modelpool)
         self.method.on_run_end()
+        
+        # Get runtime info immediately after merging completes
+        runtime_info = self.method.get_runtime_info()
+        
+        # Save runtime report immediately (before benchmarking)
+        # This ensures we capture runtime even if benchmarking fails/crashes
+        if self.report_save_path is not None:
+            runtime_report_path = self.report_save_path.replace('.json', '_runtime.json')
+            os.makedirs(os.path.dirname(runtime_report_path), exist_ok=True)
+            with open(runtime_report_path, 'w') as f:
+                json.dump({
+                    'runtime_info': runtime_info,
+                    'method_name': self.method.__class__.__name__,
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'note': 'Runtime excludes benchmarking - only model merging operations'
+                }, f, indent=2)
+            log.info(f"Runtime report saved immediately after merging: {runtime_report_path}")
 
         if merged_model is None:
             log.info(
@@ -275,6 +293,10 @@ class FabricModelFusionProgram(
             self.save_merged_model(merged_model)
             if self.taskpool is not None:
                 report = self.evaluate_merged_model(self.taskpool, merged_model)
+                
+                # Add runtime information to the report
+                report['_runtime_info'] = runtime_info
+                
                 try:
                     if rank_zero_only.rank == 0:
                         print_json(report, print_type=False)
@@ -293,5 +315,6 @@ class FabricModelFusionProgram(
                         )
                     os.makedirs(os.path.dirname(self.report_save_path), exist_ok=True)
                     json.dump(report, open(self.report_save_path, "w"))
+                    log.info(f"Complete results with benchmarking saved to: {self.report_save_path}")
             else:
                 log.info("No task pool specified. Skipping evaluation.")

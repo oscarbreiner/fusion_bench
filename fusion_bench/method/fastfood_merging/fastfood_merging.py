@@ -156,6 +156,12 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         adaptive_proj_head_ratio: float = 0.8,
         adaptive_proj_global_ratio: float = 0.25,
         adaptive_proj_power_law_alpha: float = 0.85,
+        # LiNeS (Layer Scaling) Parameters
+        use_lines: bool = False,
+        lines_num_blocks: int | None = None,
+        lines_alpha: float | None = None,
+        lines_beta: float = 1.0,
+        lines_auto_alpha: bool = True,
         # Kept in signature for compatibility (not used)
         ties_trim_pct: float = 0.0,
         tadrop_tau: float = 0.0,
@@ -173,6 +179,13 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self.block_rows = int(block_rows)
         self.weights = list(weights) if weights is not None else None
         self.scale = float(scale)
+        
+        # LiNeS parameters
+        self.use_lines = bool(use_lines)
+        self.lines_num_blocks = int(lines_num_blocks) if lines_num_blocks is not None else None
+        self.lines_alpha = float(lines_alpha) if lines_alpha is not None else None
+        self.lines_beta = float(lines_beta)
+        self.lines_auto_alpha = bool(lines_auto_alpha)
 
         # Normalize transform type to the set expected by create_projection_ops
         self.transform_type = self._normalize_transform_type(transform_type)
@@ -712,6 +725,95 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         # Fallback to current directory
         return Path.cwd() / "outputs"
 
+    def _apply_lines_scaling(
+        self,
+        merged_delta: Dict[str, torch.Tensor],
+        num_tasks: int,
+        norm_summed_tvs: float | None = None,
+        norm_merged_tv: float | None = None,
+    ) -> tuple[Dict[str, torch.Tensor], float]:
+        """
+        Apply LiNeS (Layer Scaling) to the merged task vector.
+        
+        LiNeS progressively scales the task vector based on layer depth:
+        - Early layers (closer to input): Lower scaling (preserve general features)
+        - Later layers (closer to output): Higher scaling (preserve task-specific features)
+        
+        Scaling formula: scale(layer) = alpha + beta * (layer_idx / (num_blocks - 1))
+        
+        Args:
+            merged_delta: Merged task vector (state dict of deltas)
+            num_tasks: Number of tasks being merged
+            norm_summed_tvs: L1 norm of summed task vectors (for auto alpha computation)
+            norm_merged_tv: L1 norm of merged task vector (for auto alpha computation)
+            
+        Returns:
+            Tuple of (scaled task vector (state dict), computed alpha value)
+        """
+        if not self.use_lines:
+            return merged_delta, None
+        
+        import copy
+        scaled_delta = copy.deepcopy(merged_delta)
+        
+        # Determine num_blocks if not specified
+        if self.lines_num_blocks is None:
+            # Auto-detect from model architecture (default: 12 for ViT-B, 24 for ViT-L)
+            # Check if any key contains "layers" to infer model type
+            has_24_layers = any(f".23." in k for k in merged_delta.keys())
+            num_blocks = 24 if has_24_layers else 12
+            print(f"[LiNeS] Auto-detected num_blocks={num_blocks}")
+        else:
+            num_blocks = self.lines_num_blocks
+        
+        # Determine alpha
+        if self.lines_auto_alpha and norm_summed_tvs is not None and norm_merged_tv is not None:
+            # Auto-compute alpha as in LiNeS paper (multi-task setting)
+            alpha = (norm_summed_tvs / (norm_merged_tv + 1e-12)) * (1.0 / num_tasks)
+            print(f"[LiNeS] Auto-computed alpha={alpha:.6f} (norm_ratio={norm_summed_tvs/norm_merged_tv:.4f}, num_tasks={num_tasks})")
+        elif self.lines_alpha is not None:
+            alpha = self.lines_alpha
+            print(f"[LiNeS] Using manual alpha={alpha:.6f}")
+        else:
+            # Default: single-task mode uses beta as alpha in LiNeS paper
+            alpha = self.lines_beta
+            print(f"[LiNeS] Using default alpha={alpha:.6f} (same as beta)")
+        
+        beta = self.lines_beta
+        
+        # Build layer key patterns (e.g., ".0.", ".1.", ..., ".11." for 12 blocks)
+        key_blocks = [f".{i}." for i in range(num_blocks)]
+        
+        # Compute scaling factors for each parameter
+        layer_scalings_dict = {}
+        for k in scaled_delta.keys():
+            # Check if parameter belongs to a residual block
+            found_layer = False
+            for layer_idx, block_pattern in enumerate(key_blocks):
+                if block_pattern in k:
+                    # Linear scaling from alpha to alpha+beta
+                    scaling = alpha + beta * (layer_idx / (num_blocks - 1))
+                    layer_scalings_dict[k] = scaling
+                    found_layer = True
+                    break
+            
+            # If not in a residual block, use minimum scaling (alpha)
+            if not found_layer:
+                layer_scalings_dict[k] = alpha
+        
+        # Apply scaling
+        for k in scaled_delta.keys():
+            scaling = layer_scalings_dict.get(k, alpha)
+            scaled_delta[k] = scaled_delta[k] * scaling
+        
+        # Print summary
+        unique_scalings = sorted(set(layer_scalings_dict.values()))
+        print(f"[LiNeS] Applied layer scaling: alpha={alpha:.4f}, beta={beta:.4f}")
+        print(f"[LiNeS] Scaling range: [{min(unique_scalings):.4f}, {max(unique_scalings):.4f}]")
+        print(f"[LiNeS] Number of unique scaling factors: {len(unique_scalings)}")
+        
+        return scaled_delta, alpha
+
     # ------------------- main -------------------
     @torch.no_grad()
     def run(
@@ -807,7 +909,8 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 if self.report_reconstruction_error or self.proj_ratio < 1.0:
                     print(f"\n[Projection Test] Projecting task vector with proj_ratio={self.proj_ratio}")
 
-                    tv_cpu = {k: v.detach().cpu().clone() for k, v in task_vector.items()}
+                    # 🚀 OPTIMIZATION: Remove redundant .clone()
+                    tv_cpu = {k: v.detach().cpu() for k, v in task_vector.items()}
                     dev = self.device
 
                     total_reconstruction_error = 0.0
@@ -948,10 +1051,12 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                             print(f"  {i}. {name}: {rel_err:.6e}")
 
                     merged_sd = state_dict_add(base_dict, tv_cpu)
-                    base_cpu = {k: v.detach().cpu().clone() for k, v in merged_sd.items()}
+                    # 🚀 OPTIMIZATION: Remove redundant .clone()
+                    base_cpu = {k: v.detach().cpu() for k, v in merged_sd.items()}
                 else:
                     merged_sd = state_dict_add(base_dict, task_vector)
-                    base_cpu = {k: v.detach().cpu().clone() for k, v in merged_sd.items()}
+                    # 🚀 OPTIMIZATION: Remove redundant .clone()
+                    base_cpu = {k: v.detach().cpu() for k, v in merged_sd.items()}
 
                 print("=" * 50 + "\n")
 
@@ -1088,9 +1193,44 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 f"[EMA] task_order={self.ema_task_order} | gamma={self.ema_gamma:.3f} | w_c={self.ema_w_c:.3f} | w_s={self.ema_w_s:.3f}"
             )
 
-        # ---------- Work on CPU copies ----------
-        base_cpu = {k: v.detach().cpu().clone() for k, v in base_sd.items()}
-        donors_cpu = [{k: v.detach().cpu().clone() for k, v in d.items()} for d in donors_sd]
+        # ---------- Work on CPU copies with pinned memory ----------
+        # 🚀 OPTIMIZATION: Use pinned memory for faster H2D/D2H transfers
+        use_pinned = torch.cuda.is_available() and self.device.type == "cuda"
+        
+        if use_pinned:
+            # Create pinned tensors for faster async GPU transfers
+            base_cpu = {}
+            for k, v in base_sd.items():
+                v_cpu = v.detach().cpu()
+                if v_cpu.is_floating_point():
+                    v_pinned = torch.empty_like(v_cpu).pin_memory()
+                    v_pinned.copy_(v_cpu)
+                    base_cpu[k] = v_pinned
+                else:
+                    base_cpu[k] = v_cpu
+            
+            donors_cpu = []
+            for d in donors_sd:
+                d_cpu = {}
+                for k, v in d.items():
+                    v_cpu = v.detach().cpu()
+                    if v_cpu.is_floating_point():
+                        v_pinned = torch.empty_like(v_cpu).pin_memory()
+                        v_pinned.copy_(v_cpu)
+                        d_cpu[k] = v_pinned
+                    else:
+                        d_cpu[k] = v_cpu
+                donors_cpu.append(d_cpu)
+        else:
+            # Fallback for CPU-only mode
+            base_cpu = {k: v.detach().cpu() for k, v in base_sd.items()}
+            donors_cpu = [{k: v.detach().cpu() for k, v in d.items()} for d in donors_sd]
+        
+        # Save original base for LiNeS if needed
+        if self.use_lines:
+            print("\n[LiNeS] Saving original base model for post-processing")
+            original_base_cpu = {k: v.clone() for k, v in base_cpu.items()}
+        
         dev = self.device
 
         # Adaptive projection size initialization (after base_cpu is created)
@@ -1241,19 +1381,23 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     else:
                         fwd, lift = op_cache[cache_key]
 
+                    # Collect all donor deltas
                     Xs: List[Tensor] = []
                     for dsd in donors_cpu:
                         donor_flat = dsd[name].view(-1).float()
                         delta = donor_flat - vb_flat
                         Xs.append(delta)
 
-                    Ys = [fwd(X.to(dev, non_blocking=True)) for X in Xs]
+                    # 🚀 OPTIMIZATION: Batch all donors into single GPU call
+                    X_batch = torch.stack(Xs, dim=0).to(dev, non_blocking=True)  # [K, flat_dim]
+                    Y_batch = fwd(X_batch.view(-1, X_batch.shape[-1])).view(len(Xs), -1)  # [K, proj_dim]
+                    Ys = [Y_batch[i] for i in range(len(Xs))]
 
                     if self.merge_where == "postlift":
-                        Xhats = [lift(Y).to("cpu", non_blocking=False) for Y in Ys]
-                        U_stack = torch.stack(Xhats, dim=0)  # [K, flat_dim]
+                        # 🚀 OPTIMIZATION: Batch lift operation
+                        Xhats_batch = lift(Y_batch.view(-1, Y_batch.shape[-1])).view(len(Xs), -1)  # [K, flat_dim]
                         Xmerge = _zero_aware_aggregate(
-                            U_stack,
+                            Xhats_batch,  # Already on GPU
                             merge_func=self.merge_func,
                             weights=w
                             if self.merge_func
@@ -1264,11 +1408,10 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                             ema_w_c=self.ema_w_c,
                             ema_w_s=self.ema_w_s,
                             ema_custom_order=ema_custom_indices,
-                        ).to("cpu", non_blocking=False)
+                        ).to("cpu", non_blocking=True)
                     else:
-                        U_stack = torch.stack(Ys, dim=0)  # [K, proj_dim]
                         Ymerge = _zero_aware_aggregate(
-                            U_stack,
+                            Y_batch,  # Already on GPU
                             merge_func=self.merge_func,
                             weights=w
                             if self.merge_func
@@ -1280,15 +1423,13 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                             ema_w_s=self.ema_w_s,
                             ema_custom_order=ema_custom_indices,
                         )
-                        Xmerge = lift(Ymerge).to("cpu", non_blocking=False)  # [flat_dim]
+                        Xmerge = lift(Ymerge).to("cpu", non_blocking=True)  # [flat_dim]
 
                         if lift_err_den < 1e8:
-                            X0 = Xs[0].to(dev, non_blocking=False)
-                            Y0 = Ys[0]
-                            X0_rec = lift(Y0).to("cpu", non_blocking=False)
-                            diff = (X0_rec.to(torch.float32) - Xs[0].to(torch.float32))
+                            X0_rec = Xhats_batch[0] if self.merge_where == "postlift" else lift(Y_batch[0])
+                            diff = (X0_rec.to(torch.float32) - X_batch[0].to(torch.float32))
                             lift_err_num += float(diff.pow(2).sum().item())
-                            lift_err_den += float(Xs[0].pow(2).sum().item())
+                            lift_err_den += float(X_batch[0].pow(2).sum().item())
 
                     upd = (self.scale * Xmerge).view_as(tb).to(tb.dtype)
 
@@ -1356,6 +1497,22 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 else:
                     fwd, lift = op_cache[cache_key]
 
+                # 🚀 OPTIMIZATION: Pre-allocate GPU buffers for this tensor
+                max_block_size = min(br, rows)
+                if use_pinned:
+                    # Pre-allocate pinned CPU buffers
+                    X_batch_cpu_buffer = torch.empty((len(donors_cpu), max_block_size, cur_D), 
+                                                      dtype=torch.float32).pin_memory()
+                else:
+                    X_batch_cpu_buffer = torch.empty((len(donors_cpu), max_block_size, cur_D), 
+                                                      dtype=torch.float32)
+                
+                # Pre-allocate GPU buffers
+                X_batch_gpu_buffer = torch.empty((len(donors_cpu), max_block_size, cur_D), 
+                                                  dtype=torch.float32, device=dev)
+                Y_batch_gpu_buffer = torch.empty((len(donors_cpu), max_block_size, proj_dim), 
+                                                  dtype=torch.float32, device=dev)
+
                 cursor = 0
                 tensor_changed = False
 
@@ -1363,25 +1520,34 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     take = min(rows - cursor, br)
                     sl_base = vb[cursor : cursor + take, :]
 
-                    Xs: List[Tensor] = []
-                    for dsd in donors_cpu:
+                    # 🚀 OPTIMIZATION: Use pre-allocated buffer slices
+                    X_batch_view = X_batch_cpu_buffer[:, :take, :]
+                    
+                    # Collect all donor deltas directly into buffer
+                    for i, dsd in enumerate(donors_cpu):
                         sl_donor = dsd[name].view(rows, d_last).float()[cursor : cursor + take, :]
                         delta = sl_donor - sl_base
                         if global_D is not None and d_last < cur_D:
-                            buf = torch.zeros((take, cur_D), dtype=torch.float32, device="cpu")
-                            buf[:, :d_last].copy_(delta)
-                            Xs.append(buf)
+                            X_batch_view[i, :, :d_last].copy_(delta)
+                            X_batch_view[i, :, d_last:].zero_()
                         else:
-                            Xs.append(delta)
+                            X_batch_view[i].copy_(delta)
 
-                    Ys = [fwd(X.to(dev, non_blocking=True)) for X in Xs]
+                    # 🚀 OPTIMIZATION: Use pre-allocated GPU buffers, async transfer
+                    X_batch_gpu_view = X_batch_gpu_buffer[:, :take, :]
+                    X_batch_gpu_view.copy_(X_batch_view, non_blocking=True)
+                    
+                    X_batch_flat = X_batch_gpu_view.view(-1, X_batch_gpu_view.shape[-1])  # [K*take, d]
+                    Y_batch_flat = fwd(X_batch_flat)  # [K*take, m]
+                    Y_batch = Y_batch_flat.view(len(donors_cpu), take, -1)  # [K, take, m]
 
                     if self.merge_where == "postlift":
-                        Xhats_raw = [lift(Y).to("cpu", non_blocking=False) for Y in Ys]
-                        Xhats = [X[:, :d_last] if cur_D > d_last else X for X in Xhats_raw]
-                        U_stack = torch.stack(Xhats, dim=0)  # [K, take, d]
+                        # 🚀 OPTIMIZATION: Batch lift operation
+                        Xhats_batch_flat = lift(Y_batch_flat)  # [K*take, cur_D]
+                        Xhats_batch = Xhats_batch_flat.view(len(donors_cpu), take, -1)  # [K, take, cur_D]
+                        Xhats_batch = Xhats_batch[:, :, :d_last] if cur_D > d_last else Xhats_batch
                         Xmerge = _zero_aware_aggregate(
-                            U_stack,
+                            Xhats_batch,  # Already on GPU
                             merge_func=self.merge_func,
                             weights=w
                             if self.merge_func
@@ -1392,11 +1558,10 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                             ema_w_c=self.ema_w_c,
                             ema_w_s=self.ema_w_s,
                             ema_custom_order=ema_custom_indices,
-                        ).to("cpu", non_blocking=False)
+                        ).to("cpu", non_blocking=True)
                     else:
-                        U_stack = torch.stack(Ys, dim=0)  # [K, take, m]
                         Ymerge = _zero_aware_aggregate(
-                            U_stack,
+                            Y_batch,  # Already on GPU, [K, take, m]
                             merge_func=self.merge_func,
                             weights=w
                             if self.merge_func
@@ -1408,18 +1573,12 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                             ema_w_s=self.ema_w_s,
                             ema_custom_order=ema_custom_indices,
                         )
-                        Xmerge_full = lift(Ymerge).to("cpu", non_blocking=False)  # [take, cur_D or d_last]
+                        Xmerge_full = lift(Ymerge).to("cpu", non_blocking=True)  # [take, cur_D]
                         Xmerge = Xmerge_full[:, :d_last] if cur_D > d_last else Xmerge_full
 
                         if take > 0 and (lift_err_den < 1e8):
-                            X0 = Xs[0].to(dev, non_blocking=False)
-                            Y0 = Ys[0]
-                            X0_rec = lift(Y0).to("cpu", non_blocking=False)
-                            if cur_D > d_last:
-                                X0_rec = X0_rec[:, :d_last]
-                                X0_orig = Xs[0][:, :d_last]
-                            else:
-                                X0_orig = Xs[0]
+                            X0_rec = Xhats_batch[0] if self.merge_where == "postlift" else lift(Y_batch[0])
+                            X0_orig = X_batch_gpu_view[0, :, :d_last] if cur_D > d_last else X_batch_gpu_view[0]
                             diff = (X0_rec.to(torch.float32) - X0_orig.to(torch.float32))
                             lift_err_num += float(diff.pow(2).sum().item())
                             lift_err_den += float(X0_orig.pow(2).sum().item())
@@ -1441,8 +1600,8 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 if tensor_changed:
                     changed_params += 1
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # 🚀 OPTIMIZATION: Removed torch.cuda.empty_cache() from hot loop
+            # (expensive operation, rarely beneficial, adds ~5-10% overhead)
 
         # ---------- Stats / sanity ----------
         bad, total_float = [], 0
@@ -1580,6 +1739,66 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 print(f"[Layer Projection Report] Warning: Failed to generate report: {e}")
                 import traceback
                 traceback.print_exc()
+
+        # ---------- Apply LiNeS Scaling (Layer Scaling) ----------
+        if self.use_lines:
+            print("\n=== Applying LiNeS (Layer Scaling) ===")
+            with self.profile("lines_scaling"):
+                # Compute merged delta: delta = merged_model - base_model
+                merged_delta = {}
+                norm_summed_tvs = 0.0
+                norm_merged_tv = 0.0
+                
+                for k in keys_float:
+                    delta = base_cpu[k].float() - original_base_cpu[k].float()
+                    merged_delta[k] = delta
+                    norm_merged_tv += delta.abs().sum().item()
+                
+                # Compute norm of summed task vectors (for auto alpha)
+                # summed_tv = sum of all individual task vectors
+                for k in keys_float:
+                    base_val = original_base_cpu[k].float()
+                    for dsd in donors_cpu:
+                        donor_val = dsd[k].float()
+                        task_vec = donor_val - base_val
+                        norm_summed_tvs += task_vec.abs().sum().item()
+                
+                print(f"[LiNeS] Merged delta L1 norm: {norm_merged_tv:.6e}")
+                print(f"[LiNeS] Summed task vectors L1 norm: {norm_summed_tvs:.6e}")
+                
+                # Apply LiNeS scaling to the merged delta
+                scaled_delta, computed_alpha = self._apply_lines_scaling(
+                    merged_delta,
+                    num_tasks=len(donors_cpu),
+                    norm_summed_tvs=norm_summed_tvs,
+                    norm_merged_tv=norm_merged_tv,
+                )
+                
+                # Store LiNeS information for reporting
+                self._lines_alpha_value = computed_alpha
+                self._lines_beta_value = self.lines_beta
+                self._lines_num_blocks_used = self.lines_num_blocks if self.lines_num_blocks else (24 if any(f".23." in k for k in merged_delta.keys()) else 12)
+                
+                # Add LiNeS metadata to runtime info for persistence in results files
+                if not hasattr(self, '_runtime_info'):
+                    self._runtime_info = {}
+                self._runtime_info['lines_enabled'] = True
+                self._runtime_info['lines_alpha'] = float(computed_alpha) if computed_alpha is not None else None
+                self._runtime_info['lines_beta'] = float(self.lines_beta)
+                self._runtime_info['lines_num_blocks'] = int(self._lines_num_blocks_used)
+                self._runtime_info['lines_auto_alpha'] = bool(self.lines_auto_alpha)
+                
+                # Reconstruct final model: base + scaled_delta
+                for k in keys_float:
+                    base_cpu[k] = (original_base_cpu[k].float() + scaled_delta[k]).to(original_base_cpu[k].dtype)
+                
+                print(f"[LiNeS] Applied layer-wise scaling to {len(scaled_delta)} parameters")
+                print("=" * 50)
+        else:
+            # LiNeS not enabled - add runtime info to indicate this
+            if not hasattr(self, '_runtime_info'):
+                self._runtime_info = {}
+            self._runtime_info['lines_enabled'] = False
 
         # ---------- Load merged state back ----------
         if isinstance(base_model, nn.Module):

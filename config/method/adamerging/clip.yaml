@@ -16,7 +16,7 @@ strict: false
 devices: 1
 batch_size: 16
 num_workers: 8
-max_steps: 1000
+max_steps: 500
 fast_dev_run: ${fast_dev_run}
 # the path for saving the merging weights
 save_merging_weights: 'merging_weights.pt'

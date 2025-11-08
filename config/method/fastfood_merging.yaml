@@ -175,3 +175,26 @@ analysis_output_path: null    # Path for analysis outputs (uses fabric logger if
 use_task_arithmetic_reconstruction: false
 task_arithmetic_scaling: 1.0  # Standard TA scaling factor
 report_reconstruction_error: true  # Report reconstruction error after projection
+
+# ============================================================================
+# LiNeS (Layer Scaling) Parameters
+# ============================================================================
+use_lines: false              # Enable LiNeS layer-wise progressive scaling
+lines_num_blocks: null        # Number of residual blocks (null = auto-detect: 12 for ViT-B, 24 for ViT-L)
+lines_alpha: null             # Minimum scaling factor (null = auto-compute or use beta)
+                              # - If lines_auto_alpha=true: alpha = (norm_summed_tvs / norm_merged_tv) * (1 / num_tasks)
+                              # - If lines_auto_alpha=false and lines_alpha=null: alpha = lines_beta
+lines_beta: 1.0               # Maximum additional scaling (creates gradient from early to late layers)
+                              # Scaling formula: scale(layer) = alpha + beta * (layer_idx / (num_blocks - 1))
+                              # Example: alpha=0.2, beta=0.8 → scales from 0.2 (early layers) to 1.0 (late layers)
+lines_auto_alpha: true        # Auto-compute alpha from task vector norms (recommended for multi-task)
+                              # When true: alpha adapts to the merging configuration
+                              # When false: use manual lines_alpha or default to lines_beta
+
+# LiNeS Explanation:
+# - LiNeS applies layer-depth-dependent scaling to merged task vectors
+# - Early layers (general features): lower scaling → preserve pretrained knowledge
+# - Later layers (task-specific): higher scaling → preserve task adaptations
+# - This reduces catastrophic forgetting and improves multi-task merging
+# - Compatible with all merge functions (sum, mean, ties, ema, signmax, etc.)
+# - Reference: "LiNeS: Post-training Layer Scaling Prevents Forgetting and Enhances Model Merging"

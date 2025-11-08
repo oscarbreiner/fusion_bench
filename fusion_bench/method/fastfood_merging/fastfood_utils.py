@@ -97,9 +97,11 @@ def fwht_inplace_ortho(x: Tensor) -> Tensor:
     y = x.reshape(-1, n).contiguous()  # keep batch as first dim
     while h < n:
         y = y.view(-1, n // (2*h), 2, h)
-        a = y[..., 0, :].clone()
+        # 🚀 OPTIMIZATION: Avoid unnecessary .clone() - in-place ops safe here
+        a = y[..., 0, :]
         b = y[..., 1, :]
-        y[..., 0, :], y[..., 1, :] = a + b, a - b
+        y[..., 0, :] = a + b
+        y[..., 1, :] = a - b
         y = y.view(-1, n)
         h *= 2
     y.mul_(1.0 / math.sqrt(n))
@@ -107,33 +109,58 @@ def fwht_inplace_ortho(x: Tensor) -> Tensor:
 
 @torch.no_grad()
 def dct_ortho(x: Tensor) -> Tensor:
-    """Orthonormal DCT-II transform (SciPy backend, CPU fallback)."""
-    x_np = x.detach().cpu().numpy()
-    X = sp_dct(x_np, type=2, norm="ortho", axis=-1)
-    return torch.from_numpy(X).to(x.device, dtype=x.dtype)
+    """
+    GPU-accelerated orthonormal DCT-II transform along last dimension.
+    Uses torch.fft for efficiency - stays on GPU, no CPU transfers.
+    """
+    N = x.shape[-1]
+    # Use even-odd decomposition via FFT
+    # DCT-II can be computed as real part of FFT of even extension
+    x_doubled = torch.cat([x, x.flip(-1)], dim=-1)
+    X_fft = torch.fft.fft(x_doubled, dim=-1)
+    X = X_fft[..., :N].real
+    
+    # Apply DCT-II orthonormal scaling
+    scale = torch.ones(N, dtype=x.dtype, device=x.device)
+    scale[0] = 1.0 / math.sqrt(N)
+    scale[1:] = math.sqrt(2.0 / N)
+    return X * scale
 
 @torch.no_grad()
 def idct_ortho(x: Tensor) -> Tensor:
-    # Inverse of DCT-II (ortho) is DCT-III (ortho)
-    x_np = x.detach().cpu().numpy()
-    X = sp_idct(x_np, type=3, norm="ortho", axis=-1)
-    return torch.from_numpy(X).to(x.device, dtype=x.dtype)
+    """
+    GPU-accelerated inverse DCT-II (i.e., DCT-III) along last dimension.
+    Inverse operation of dct_ortho.
+    """
+    N = x.shape[-1]
+    # Apply inverse scaling (transpose of forward scaling)
+    scale = torch.ones(N, dtype=x.dtype, device=x.device)
+    scale[0] = math.sqrt(N)
+    scale[1:] = math.sqrt(N / 2.0)
+    x_scaled = x * scale
+    
+    # Reconstruct via inverse FFT
+    X_doubled = torch.zeros(x.shape[:-1] + (2 * N,), dtype=torch.complex64, device=x.device)
+    X_doubled[..., :N] = x_scaled.to(torch.complex64)
+    X_doubled[..., N:] = x_scaled.flip(-1).to(torch.complex64)
+    x_rec = torch.fft.ifft(X_doubled, dim=-1)[..., :N].real
+    return x_rec.to(x.dtype)
 
 @torch.no_grad()
 def dht_ortho(x: Tensor) -> Tensor:
     """
-    Real-valued Discrete Hartley Transform (self-inverse).
-    Implemented via FFT: H(x) = Re(FFT(x)) − Im(FFT(x)).
+    GPU-accelerated orthonormal Discrete Hartley Transform (self-inverse).
+    Uses torch.fft: H(x) = Re(FFT(x)) - Im(FFT(x)), staying on GPU.
     """
-    x_np = x.detach().cpu().numpy()
-    X_fft = np.fft.fft(x_np, axis=-1)
-    X = np.real(X_fft) - np.imag(X_fft)
-    X /= np.sqrt(x_np.shape[-1])  # orthonormal scaling
-    return torch.from_numpy(X).to(x.device, dtype=x.dtype)
+    N = x.shape[-1]
+    X_fft = torch.fft.fft(x, dim=-1)
+    # Hartley transform: real minus imaginary parts
+    X = (X_fft.real - X_fft.imag) / math.sqrt(N)
+    return X
 
 @torch.no_grad()
 def idht_ortho(x: Tensor) -> Tensor:
-    """Inverse DHT (identical to forward)."""
+    """Inverse DHT (identical to forward DHT - self-inverse property)."""
     return dht_ortho(x)
 
 

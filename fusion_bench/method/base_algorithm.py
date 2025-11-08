@@ -35,8 +35,9 @@ Example:
 """
 
 import logging
+import time
 from abc import abstractmethod
-from typing import Optional  # noqa: F401
+from typing import Optional, Dict, Any  # noqa: F401
 
 from fusion_bench.mixins import BaseYAMLSerializable
 from fusion_bench.modelpool import BaseModelPool
@@ -61,6 +62,7 @@ class BaseAlgorithm(BaseYAMLSerializable):
     Attributes:
         _program: Optional program reference for algorithm execution context.
         _config_key (str): Configuration key used for YAML serialization, defaults to "method".
+        _runtime_info (Dict[str, Any]): Runtime information for the algorithm execution.
 
     Examples:
         Creating a simple averaging algorithm:
@@ -85,6 +87,16 @@ class BaseAlgorithm(BaseYAMLSerializable):
 
     _program = None
     _config_key = "method"
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Initialize runtime tracking
+        self._runtime_info: Dict[str, Any] = {
+            'merging_start_time': None,
+            'merging_end_time': None,
+            'merging_duration_seconds': None,
+            'merging_duration_formatted': None,
+        }
 
     def on_run_start(self):
         """
@@ -98,17 +110,18 @@ class BaseAlgorithm(BaseYAMLSerializable):
         - Validating prerequisites
         - Preparing computational resources
 
-        The default implementation does nothing, allowing subclasses to override
-        as needed for their specific requirements.
+        The default implementation tracks the start time for runtime measurement.
+        Subclasses should call super().on_run_start() if they override this method.
 
         Examples:
             >>> class MyAlgorithm(BaseAlgorithm):
             ...     def on_run_start(self):
-            ...         super().on_run_start()
+            ...         super().on_run_start()  # Keep runtime tracking
             ...         print("Starting model fusion...")
             ...         self.start_time = time.time()
         """
-        pass
+        # Track merging start time
+        self._runtime_info['merging_start_time'] = time.time()
 
     def on_run_end(self):
         """
@@ -125,17 +138,48 @@ class BaseAlgorithm(BaseYAMLSerializable):
         The method is called regardless of whether the `run` method succeeded or failed,
         making it suitable for cleanup operations that should always occur.
 
-        The default implementation does nothing, allowing subclasses to override
-        as needed for their specific requirements.
+        The default implementation calculates and logs the runtime duration.
+        Subclasses should call super().on_run_end() if they override this method.
 
         Examples:
             >>> class MyAlgorithm(BaseAlgorithm):
             ...     def on_run_end(self):
-            ...         super().on_run_end()
+            ...         super().on_run_end()  # Keep runtime tracking
             ...         elapsed = time.time() - self.start_time
             ...         print(f"Fusion completed in {elapsed:.2f}s")
         """
-        pass
+        # Track merging end time and calculate duration
+        self._runtime_info['merging_end_time'] = time.time()
+        
+        if self._runtime_info['merging_start_time'] is not None:
+            duration = self._runtime_info['merging_end_time'] - self._runtime_info['merging_start_time']
+            self._runtime_info['merging_duration_seconds'] = duration
+            
+            # Format duration as human-readable string
+            hours = int(duration // 3600)
+            minutes = int((duration % 3600) // 60)
+            seconds = int(duration % 60)
+            
+            if hours > 0:
+                formatted = f"{hours}h {minutes}m {seconds}s"
+            elif minutes > 0:
+                formatted = f"{minutes}m {seconds}s"
+            else:
+                formatted = f"{seconds}s"
+            
+            self._runtime_info['merging_duration_formatted'] = formatted
+            
+            log.info(f"Model merging completed in {formatted} ({duration:.2f}s)")
+    
+    def get_runtime_info(self) -> Dict[str, Any]:
+        """
+        Get runtime information for the algorithm execution.
+        
+        Returns:
+            Dict containing runtime information including start time, end time, 
+            duration in seconds, and human-readable formatted duration.
+        """
+        return self._runtime_info.copy()
 
     @abstractmethod
     def run(self, modelpool: BaseModelPool):

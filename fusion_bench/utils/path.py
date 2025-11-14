@@ -64,6 +64,16 @@ def create_symlink(src_dir: str, dst_dir: str, link_name: str = None):
     link_path = os.path.join(dst_dir, link_name)
 
     try:
+        # Check if symlink already exists
+        if os.path.islink(link_path):
+            # Remove existing symlink
+            os.unlink(link_path)
+            log.info(f"Removed existing symbolic link: {link_path}")
+        elif os.path.exists(link_path):
+            # Path exists but is not a symlink (file or directory)
+            log.warning(f"Path exists and is not a symlink: {link_path}. Skipping symlink creation.")
+            return
+        
         # if the system is windows, use the `mklink` command in "CMD" to create the symlink
         if os.name == "nt":
             os.system(
@@ -78,4 +88,3 @@ def create_symlink(src_dir: str, dst_dir: str, link_name: str = None):
         log.info(f"Created symbolic link: {link_path} -> {src_dir}")
     except OSError as e:
         log.warning(f"Failed to create symbolic link: {e}")
-        raise

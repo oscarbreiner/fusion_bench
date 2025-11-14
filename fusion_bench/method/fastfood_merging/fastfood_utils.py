@@ -32,6 +32,7 @@ from torch import Tensor
 __all__ = [
     "EPS",
     "create_projection_ops",
+    "create_multi_sketch_ops",
     "fwht_inplace_ortho",
     "dct_ortho",
     "idct_ortho",
@@ -58,6 +59,9 @@ __all__ = [
     "coherence_penalized_weights",
     "orthogonal_deflation_merge",
     "odm_ema_tuning_free",
+    "subspace_boosting",
+    "generate_tall_masks",
+    "apply_consensus_mask",
 ]
 
 # Constants
@@ -381,6 +385,74 @@ def create_projection_ops(
     return fwd, lift
 
 # ============================================================================
+# Multi-Sketch Projection Operators
+# ============================================================================
+
+@torch.no_grad()
+def create_multi_sketch_ops(
+    global_dim: int,
+    proj_dim: int,
+    *,
+    num_sketches: int,
+    transform_type: str | None,
+    seed_key: str,
+    device: torch.device,
+) -> Tuple[List[Callable[[Tensor], Tensor]], List[Callable[[Tensor], Tensor]]]:
+    """
+    Build multiple independent projection and lifting operators for multi-sketching.
+    
+    Multi-sketching uses J independent random projections A_1, A_2, ..., A_J to
+    capture different subspaces of the parameter space. Each sketch has a different
+    random seed, so they probe orthogonal directions.
+    
+    Benefits:
+    - Single projection A = s·P·H·D only captures m < d dimensions
+    - Everything orthogonal to those rows (nullspace) is lost
+    - Multiple sketches with different random seeds cover more of the full space
+    - Reconstruction averages across sketches to reduce information loss
+    
+    Args:
+        global_dim: Original input dimension D
+        proj_dim: Target projection dimension m (per sketch)
+        num_sketches: Number of independent sketches J
+        transform_type: "fwht" | "srht" | "dct" | "dht" | "fastfood" | "none" | None
+        seed_key: Base seed key (each sketch gets seed_key_j)
+        device: torch.device for created tensors
+        
+    Returns:
+        (fwd_ops, lift_ops) where each is a list of J callables
+        
+    Example usage:
+        >>> fwd_ops, lift_ops = create_multi_sketch_ops(512, 128, num_sketches=3, ...)
+        >>> # Project with each sketch
+        >>> y_sketches = [fwd_j(x) for fwd_j in fwd_ops]
+        >>> # ... merge each sketch separately ...
+        >>> # Lift and ensemble
+        >>> x_lifted = [lift_j(y_j) for lift_j, y_j in zip(lift_ops, y_merged_sketches)]
+        >>> x_final = torch.stack(x_lifted, dim=0).mean(dim=0)
+    """
+    fwd_ops = []
+    lift_ops = []
+    
+    for j in range(num_sketches):
+        # Create unique seed for each sketch
+        sketch_seed = f"{seed_key}_sketch_{j}"
+        
+        # Create independent projection operators
+        fwd_j, lift_j = create_projection_ops(
+            global_dim=global_dim,
+            proj_dim=proj_dim,
+            transform_type=transform_type,
+            seed_key=sketch_seed,
+            device=device,
+        )
+        
+        fwd_ops.append(fwd_j)
+        lift_ops.append(lift_j)
+    
+    return fwd_ops, lift_ops
+
+# ============================================================================
 # TIES / EMA / Advanced aggregation (unchanged)
 # ============================================================================
 
@@ -658,6 +730,217 @@ def odm_ema_tuning_free(U: Tensor) -> Tensor:
             if len(history) > 32:
                 history.pop(0)
     return z_acc.reshape(orig_shape)
+
+# ============================================================================
+# Subspace Boosting (SB)
+# ============================================================================
+
+@torch.no_grad()
+def subspace_boosting(param: Tensor, beta: float, eps: float = 1e-12) -> Tensor:
+    """
+    Restore rank to collapsed task-vector matrices by boosting neglected singular values.
+    
+    When merging many experts, task-vector matrices often collapse in rank with most
+    energy concentrated in a few singular directions. This function boosts the smaller
+    singular values to restore a fuller-rank update.
+    
+    Algorithm:
+        1. Compute SVD: T = U Σ V^T
+        2. Compute cumulative energy: energy(k) = Σ(σ_i, i=1..k) / Σ(σ_i, all)
+        3. Find cutoff index: k* = min{k : energy(k) >= beta}
+        4. Boost singular values: σ_i' = max(σ_i, σ_k*)
+        5. Reconstruct: T' = U Σ' V^T
+    
+    Args:
+        param: Merged task-vector weight matrix (2D tensor)
+        beta: Fraction of cumulative singular value energy to preserve (0.0-1.0)
+              Typical range: 0.00-0.02
+              - Small beta: aggressive boosting (more rank restored)
+              - Large beta: mild boosting
+        eps: Small constant to avoid division by zero
+    
+    Returns:
+        Rank-boosted parameter tensor with same shape as input
+    
+    Example:
+        >>> merged_weight = merge_task_vectors([tv1, tv2, tv3])  # Shape: (out_dim, in_dim)
+        >>> boosted_weight = subspace_boosting(merged_weight, beta=0.01)
+        >>> # Now boosted_weight has restored rank with smaller singular values boosted
+    """
+    if param.ndim != 2:
+        # Only apply to 2D matrices (linear layer weights)
+        return param
+    
+    if param.numel() == 0:
+        return param
+    
+    # Compute SVD
+    U, S, Vh = torch.linalg.svd(param, full_matrices=False)
+    
+    if S.numel() == 0:
+        return param
+    
+    # Compute cumulative energy
+    total_energy = S.sum() + eps
+    cumulative_energy = torch.cumsum(S, dim=0)
+    normalized_energy = cumulative_energy / total_energy
+    
+    # Find cutoff index (first index where cumulative energy >= beta)
+    # Clamp beta to valid range
+    beta_clamped = max(0.0, min(1.0, beta))
+    above_threshold = (normalized_energy >= beta_clamped).nonzero(as_tuple=False)
+    
+    if above_threshold.numel() == 0:
+        # No singular values meet threshold, return original
+        return param
+    
+    cutoff_idx = above_threshold[0].item()
+    cutoff_value = S[cutoff_idx]
+    
+    # Boost singular values (clamp to cutoff)
+    S_boosted = torch.clamp(S, min=cutoff_value)
+    
+    # Reconstruct boosted matrix
+    # param_boosted = U @ diag(S_boosted) @ Vh
+    # Efficient: (U * S_boosted) @ Vh
+    param_boosted = (U * S_boosted.unsqueeze(0)) @ Vh
+    
+    return param_boosted
+
+# ============================================================================
+# TALL Masks (Task-Adaptive Low-rank Learning)
+# ============================================================================
+
+@torch.no_grad()
+def generate_tall_masks(
+    merged_delta: Dict[str, Tensor],
+    individual_deltas: Dict[str, Dict[str, Tensor]],
+    base_state: Dict[str, Tensor],
+    tall_mask_lambda: float = 0.6,
+) -> Dict[str, Dict[str, Tensor]]:
+    """
+    Generate task-specific TALL masks for parameter selection.
+    
+    TALL masks identify which parameters in the merged model are most relevant for each task
+    by comparing distances in parameter space:
+    
+    For each task t:
+        mask_t = |θ_0 - θ_t| > |θ_merged - θ_t| * λ
+    
+    Intuition:
+        - If a parameter changed a lot from pretrained (|θ_0 - θ_t| large)
+        - But is similar to the merged model (|θ_merged - θ_t| small)
+        - Then this parameter is important for task t → include in mask
+    
+    Args:
+        merged_delta: Merged task vector (after merging, boosting, etc.)
+        individual_deltas: Dictionary mapping task names to their individual task vectors
+        base_state: Base/pretrained model state dict
+        tall_mask_lambda: Threshold parameter (typical: 0.2-0.6)
+                         - Smaller λ: more permissive masks (more parameters kept)
+                         - Larger λ: stricter masks (fewer parameters kept)
+    
+    Returns:
+        Dictionary mapping task names to their TALL masks (same structure as state dict)
+        Each mask is a binary tensor indicating which parameters are active for that task
+    
+    Example:
+        >>> tall_masks = generate_tall_masks(merged_delta, individual_deltas, base_state, lambda=0.6)
+        >>> # tall_masks['mnist']['vision_model.encoder.layers.0.self_attn.q_proj.weight'] = Tensor([True, False, ...])
+    """
+    tall_masks = {}
+    
+    # Compute merged model state: base + merged_delta
+    merged_state = {k: base_state[k] + merged_delta[k] for k in merged_delta.keys()}
+    
+    for task_name, task_delta in individual_deltas.items():
+        task_mask = {}
+        
+        # Compute fine-tuned state for this task: base + task_delta
+        task_state = {k: base_state[k] + task_delta[k] for k in task_delta.keys()}
+        
+        for param_name in merged_delta.keys():
+            if param_name not in task_delta:
+                continue
+            
+            # Distance from pretrained to task-specific
+            diff_base_task = (base_state[param_name] - task_state[param_name]).abs()
+            
+            # Distance from merged to task-specific
+            diff_merged_task = (merged_state[param_name] - task_state[param_name]).abs()
+            
+            # TALL mask: keep parameters where task-specific change is large
+            # but distance to merged model is small (scaled by lambda)
+            mask = diff_base_task > (diff_merged_task * tall_mask_lambda)
+            
+            task_mask[param_name] = mask.float()
+        
+        tall_masks[task_name] = task_mask
+    
+    return tall_masks
+
+@torch.no_grad()
+def apply_consensus_mask(
+    merged_delta: Dict[str, Tensor],
+    tall_masks: Dict[str, Dict[str, Tensor]],
+    consensus_threshold: int = 2,
+) -> Dict[str, Tensor]:
+    """
+    Apply consensus masking to filter merged parameters based on cross-task agreement.
+    
+    Consensus masking removes parameters that are not important across multiple tasks:
+    - Catastrophic weights: parameters not activated by any task (threshold > num_tasks)
+    - Selfish weights: parameters activated by only one task (threshold = 2)
+    - Keep shared weights: parameters activated by >= threshold tasks
+    
+    Algorithm:
+        For each parameter position:
+            count = number of tasks with mask=1 at this position
+            consensus_mask = (count >= consensus_threshold)
+        merged_delta = merged_delta ⊙ consensus_mask
+    
+    Args:
+        merged_delta: Merged task vector to be filtered
+        tall_masks: Dictionary of per-task TALL masks from generate_tall_masks()
+        consensus_threshold: Minimum number of tasks that must agree (typical: 1-2)
+                            - 0: No filtering (keep all parameters)
+                            - 1: Remove only catastrophic weights (not used by any task)
+                            - 2: Remove catastrophic + selfish weights (used by <2 tasks)
+                            - >num_tasks: Remove everything (zero-shot baseline)
+    
+    Returns:
+        Filtered merged_delta with consensus mask applied
+        Parameters not meeting threshold are set to 0
+    
+    Example:
+        >>> # Remove parameters not used by at least 2 tasks
+        >>> filtered_delta = apply_consensus_mask(merged_delta, tall_masks, threshold=2)
+    """
+    consensus_mask = {}
+    
+    # Initialize consensus counter for each parameter
+    for param_name in merged_delta.keys():
+        consensus_mask[param_name] = torch.zeros_like(merged_delta[param_name])
+    
+    # Count how many tasks activate each parameter
+    for task_name, task_mask in tall_masks.items():
+        for param_name, mask in task_mask.items():
+            if param_name in consensus_mask:
+                consensus_mask[param_name] += mask
+    
+    # Apply threshold: keep only parameters activated by >= threshold tasks
+    for param_name in consensus_mask.keys():
+        consensus_mask[param_name] = (consensus_mask[param_name] >= consensus_threshold).float()
+    
+    # Apply consensus mask to merged delta
+    filtered_delta = {}
+    for param_name, delta in merged_delta.items():
+        if param_name in consensus_mask:
+            filtered_delta[param_name] = delta * consensus_mask[param_name]
+        else:
+            filtered_delta[param_name] = delta
+    
+    return filtered_delta
 
 # ============================================================================
 # Zero-Aware Aggregation Functions

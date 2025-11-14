@@ -198,3 +198,81 @@ lines_auto_alpha: true        # Auto-compute alpha from task vector norms (recom
 # - This reduces catastrophic forgetting and improves multi-task merging
 # - Compatible with all merge functions (sum, mean, ties, ema, signmax, etc.)
 # - Reference: "LiNeS: Post-training Layer Scaling Prevents Forgetting and Enhances Model Merging"
+
+# ============================================================================
+# Multi-Sketch Parameters
+# ============================================================================
+num_sketches: 1               # Number of independent random projections (J ≥ 1)
+                              # - 1: Standard single-sketch merging (default)
+                              # - >1: Multi-sketch ensemble merging
+                              # Multi-sketching uses J independent random projections A_1, ..., A_J
+                              # Each sketch captures a different random subspace of dimension m < d
+                              # Benefits:
+                              # - Single projection loses information in its nullspace
+                              # - Multiple sketches with different random seeds cover more of full space
+                              # - Ensemble reconstruction reduces information loss
+                              # - Computational cost: O(J × merging_cost)
+                              # Recommended: 3-5 sketches for balance between quality and speed
+sketch_ensemble_mode: "mean"  # How to combine lifted sketches: mean | sum | max | median
+                              # - mean: Average across sketches (recommended, reduces variance)
+                              # - sum: Sum across sketches (amplifies signal)
+                              # - max: Take maximum magnitude (preserves peaks)
+                              # - median: Robust to outlier sketches
+                              # Applied after lifting each sketch back to original space
+
+# ============================================================================
+# Subspace Boosting (SB) Parameters
+# ============================================================================
+use_subspace_boosting: false  # Enable Subspace Boosting to restore rank to collapsed task-vectors
+                              # When merging many experts, task-vector matrices often collapse in rank
+                              # with most energy concentrated in a few singular directions
+                              # SB boosts neglected singular values to restore fuller-rank updates
+                              # Applied AFTER merging, only to linear layers (MLP + attention weights)
+                              # Compatible with all merge functions (sum, mean, ties, ema, signmax, etc.)
+subspace_boosting_beta: 0.01  # Cumulative energy threshold (0.0-1.0)
+                              # Defines how much cumulative singular value energy to keep untouched
+                              # Typical range: 0.00-0.02
+                              # - Small beta (e.g., 0.00): Very aggressive boosting (more rank restored)
+                              # - Medium beta (e.g., 0.01): Balanced boosting (recommended)
+                              # - Large beta (e.g., 0.05): Mild boosting
+                              # Algorithm:
+                              #   1. SVD: T = U Σ V^T
+                              #   2. Find k* where cumulative_energy(k*) >= beta
+                              #   3. Boost: σ_i' = max(σ_i, σ_k*)
+                              #   4. Reconstruct: T' = U Σ' V^T
+                              # Reference: "Subspace Boosting for Model Merging"
+
+# ============================================================================
+# Consensus Masking (TALL Masks) Parameters
+# ============================================================================
+use_consensus_mask: false     # Enable consensus masking to filter merged parameters
+                              # Uses TALL masks (Task-Adaptive Low-rank Learning) to identify
+                              # important parameters per task, then keeps only parameters that
+                              # multiple tasks agree are important
+                              # Applied AFTER merging (and Subspace Boosting if enabled)
+                              # Compatible with all merge functions
+                              # Algorithm:
+                              #   1. Generate per-task masks: mask_t = |θ_0 - θ_t| > |θ_merged - θ_t| * λ
+                              #   2. Count cross-task agreement: count = Σ mask_t
+                              #   3. Keep only if count >= consensus_threshold
+                              # Removes:
+                              #   - Catastrophic weights (not used by any task)
+                              #   - Selfish weights (used by only one task)
+                              # Reference: "Task Arithmetic in the Tangent Space" (Ilharco et al., 2023)
+tall_mask_lambda: 0.6         # Distance threshold for per-task mask generation (0.0-1.0)
+                              # Mask criterion: |θ_0 - θ_t| > |θ_merged - θ_t| * λ
+                              # Intuition: Keep parameters where task made large changes from pretrained
+                              # but merged model is close to task model
+                              # Typical range: 0.2-0.8
+                              # - Smaller λ (e.g., 0.2): More permissive (more parameters activated)
+                              # - Larger λ (e.g., 0.8): Stricter (fewer parameters activated)
+consensus_threshold: 2        # Minimum number of tasks that must activate a parameter (>= 0)
+                              # For each parameter position:
+                              #   count = number of tasks with mask=1
+                              #   keep parameter if count >= threshold
+                              # Typical values:
+                              # - 0: No filtering (equivalent to disabling consensus mask)
+                              # - 1: Remove catastrophic weights only (not used by any task)
+                              # - 2: Remove catastrophic + selfish weights (default, recommended)
+                              # - 3+: Increasingly strict (only keep highly shared parameters)
+                              # - >num_tasks: Remove everything (not useful)

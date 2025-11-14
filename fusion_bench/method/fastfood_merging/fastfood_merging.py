@@ -18,10 +18,14 @@ from fusion_bench.utils.state_dict_arithmetic import state_dict_add, state_dict_
 from .fastfood_utils import (
     EPS,
     create_projection_ops,
+    create_multi_sketch_ops,
     zero_aware_aggregate,
     layer_key,
     normalize_weights,
     compute_global_dim,
+    subspace_boosting,
+    generate_tall_masks,
+    apply_consensus_mask,
 )
 
 # Import projection size estimator for adaptive sizing
@@ -34,6 +38,7 @@ from .projection_size_estimator import (
 
 # Keep a local alias for clarity
 _fastfood_ops = create_projection_ops
+_multi_sketch_ops = create_multi_sketch_ops
 _zero_aware_aggregate = zero_aware_aggregate
 _layer_key = layer_key
 
@@ -96,6 +101,10 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
       adaptive_proj_group_boundary: int
       adaptive_proj_feature_ratio: float
       adaptive_proj_head_ratio: float
+      
+      # Subspace Boosting parameters:
+      use_subspace_boosting: bool
+      subspace_boosting_beta: float
     """
 
     def __init__(
@@ -162,6 +171,16 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         lines_alpha: float | None = None,
         lines_beta: float = 1.0,
         lines_auto_alpha: bool = True,
+        # Multi-Sketch Parameters
+        num_sketches: int = 1,
+        sketch_ensemble_mode: str = "mean",
+        # Subspace Boosting Parameters
+        use_subspace_boosting: bool = False,
+        subspace_boosting_beta: float = 0.01,
+        # TALL Masks / Consensus Masking Parameters
+        use_consensus_mask: bool = False,
+        tall_mask_lambda: float = 0.6,
+        consensus_threshold: int = 2,
         # Kept in signature for compatibility (not used)
         ties_trim_pct: float = 0.0,
         tadrop_tau: float = 0.0,
@@ -214,6 +233,28 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
         # Embedding layer projection control
         self.project_embeddings = bool(project_embeddings)
+
+        # Multi-Sketch parameters
+        self.num_sketches = int(num_sketches)
+        self.sketch_ensemble_mode = str(sketch_ensemble_mode).lower()
+        assert self.num_sketches >= 1, f"num_sketches must be >= 1, got {self.num_sketches}"
+        assert self.sketch_ensemble_mode in {"mean", "sum", "max", "median"}, \
+            f"sketch_ensemble_mode must be one of: mean, sum, max, median (got {self.sketch_ensemble_mode})"
+
+        # Subspace Boosting parameters
+        self.use_subspace_boosting = bool(use_subspace_boosting)
+        self.subspace_boosting_beta = float(subspace_boosting_beta)
+        assert 0.0 <= self.subspace_boosting_beta <= 1.0, \
+            f"subspace_boosting_beta must be in [0, 1], got {self.subspace_boosting_beta}"
+
+        # TALL Masks / Consensus Masking parameters
+        self.use_consensus_mask = bool(use_consensus_mask)
+        self.tall_mask_lambda = float(tall_mask_lambda)
+        self.consensus_threshold = int(consensus_threshold)
+        assert 0.0 <= self.tall_mask_lambda <= 1.0, \
+            f"tall_mask_lambda must be in [0, 1], got {self.tall_mask_lambda}"
+        assert self.consensus_threshold >= 0, \
+            f"consensus_threshold must be >= 0, got {self.consensus_threshold}"
 
         # Adaptive projection size estimation
         self.use_adaptive_proj_size = bool(use_adaptive_proj_size)
@@ -271,6 +312,22 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         raise ValueError(f"Unknown transform_type='{s}'. Use one of: 'srht','fwht','dct','dht','fastfood','none' (or 'hadamard','hadamard_full','identity').")
 
     # ------------------- helpers -------------------
+    @staticmethod
+    def _is_linear_layer(name: str) -> bool:
+        """
+        Check if a parameter belongs to a linear layer (MLP or attention projection).
+        Used for selective application of Subspace Boosting.
+        """
+        linear_patterns = [
+            "attn", "attention",  # Attention projections
+            "q_proj", "k_proj", "v_proj", "out_proj",  # Explicit attention names
+            "query", "key", "value",
+            "mlp", "fc", "dense",  # MLP layers
+            "linear",  # Generic linear
+        ]
+        name_lower = name.lower()
+        return any(pattern in name_lower for pattern in linear_patterns) and ".weight" in name
+
     @staticmethod
     def _is_embedding_layer(name: str) -> bool:
         """
@@ -814,6 +871,114 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         
         return scaled_delta, alpha
 
+    # ------------------- Multi-Sketch Helper -------------------
+    def _create_projection_operators(
+        self,
+        cur_D: int,
+        proj_dim: int,
+        seed_key: str,
+        dev: torch.device,
+        op_cache: Dict,
+    ) -> Tuple[List[Callable], List[Callable]]:
+        """
+        Create projection operators, potentially multiple sketches.
+        
+        Returns:
+            (fwd_ops, lift_ops) - Lists of forward and lift operators
+            For num_sketches=1, returns single-element lists for consistency
+        """
+        if self.num_sketches == 1:
+            # Single sketch - use cached ops
+            cache_key = (self.transform_type, seed_key, cur_D, proj_dim)
+            
+            if cache_key not in op_cache:
+                fwd, lift = _fastfood_ops(
+                    cur_D,
+                    proj_dim,
+                    seed_key=seed_key,
+                    device=dev,
+                    transform_type=self.transform_type,
+                )
+                op_cache[cache_key] = (fwd, lift)
+            else:
+                fwd, lift = op_cache[cache_key]
+            
+            return [fwd], [lift]
+        else:
+            # Multi-sketch - create independent operators
+            cache_key = (self.transform_type, seed_key, cur_D, proj_dim, self.num_sketches)
+            
+            if cache_key not in op_cache:
+                fwd_ops, lift_ops = _multi_sketch_ops(
+                    cur_D,
+                    proj_dim,
+                    num_sketches=self.num_sketches,
+                    seed_key=seed_key,
+                    device=dev,
+                    transform_type=self.transform_type,
+                )
+                op_cache[cache_key] = (fwd_ops, lift_ops)
+            else:
+                fwd_ops, lift_ops = op_cache[cache_key]
+            
+            return fwd_ops, lift_ops
+
+    def _multi_sketch_project(
+        self,
+        X_batch: Tensor,
+        fwd_ops: List[Callable],
+    ) -> List[Tensor]:
+        """
+        Project data using multiple sketch operators.
+        
+        Args:
+            X_batch: Input tensor [..., D]
+            fwd_ops: List of forward projection operators
+            
+        Returns:
+            List of projected tensors, one per sketch
+        """
+        Y_sketches = []
+        for fwd_j in fwd_ops:
+            Y_j = fwd_j(X_batch)
+            Y_sketches.append(Y_j)
+        return Y_sketches
+
+    def _multi_sketch_lift_and_ensemble(
+        self,
+        Y_merged_sketches: List[Tensor],
+        lift_ops: List[Callable],
+    ) -> Tensor:
+        """
+        Lift merged sketches back to original space and ensemble.
+        
+        Args:
+            Y_merged_sketches: List of merged projections (one per sketch)
+            lift_ops: List of lift operators
+            
+        Returns:
+            Ensembled reconstruction in original space
+        """
+        # Lift each sketch
+        X_lifted = []
+        for Y_j, lift_j in zip(Y_merged_sketches, lift_ops):
+            X_j = lift_j(Y_j)
+            X_lifted.append(X_j)
+        
+        # Ensemble across sketches
+        X_stacked = torch.stack(X_lifted, dim=0)  # [J, ...]
+        
+        if self.sketch_ensemble_mode == "mean":
+            return X_stacked.mean(dim=0)
+        elif self.sketch_ensemble_mode == "sum":
+            return X_stacked.sum(dim=0)
+        elif self.sketch_ensemble_mode == "max":
+            return X_stacked.abs().max(dim=0)[0] * torch.sign(X_stacked.sum(dim=0))
+        elif self.sketch_ensemble_mode == "median":
+            return X_stacked.median(dim=0)[0]
+        else:
+            raise ValueError(f"Unknown sketch_ensemble_mode: {self.sketch_ensemble_mode}")
+
     # ------------------- main -------------------
     @torch.no_grad()
     def run(
@@ -1226,10 +1391,25 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             base_cpu = {k: v.detach().cpu() for k, v in base_sd.items()}
             donors_cpu = [{k: v.detach().cpu() for k, v in d.items()} for d in donors_sd]
         
-        # Save original base for LiNeS if needed
-        if self.use_lines:
-            print("\n[LiNeS] Saving original base model for post-processing")
+        # Save original base for LiNeS and Consensus Mask if needed
+        if self.use_lines or self.use_consensus_mask:
+            if self.use_lines:
+                print("\n[LiNeS] Saving original base model for post-processing")
+            if self.use_consensus_mask:
+                print("\n[Consensus Mask] Saving original base model and individual task vectors for post-processing")
             original_base_cpu = {k: v.clone() for k, v in base_cpu.items()}
+            
+            # Save individual task vectors for TALL mask generation
+            if self.use_consensus_mask:
+                individual_task_vectors = {}
+                for i, (donor_name, donor_sd_cpu) in enumerate(zip(donor_names, donors_cpu)):
+                    task_vector = {}
+                    for k in keys_float:
+                        if k in donor_sd_cpu and k in base_cpu:
+                            # Task vector: δ_t = θ_t - θ_0
+                            task_vector[k] = donor_sd_cpu[k].float() - base_cpu[k].float()
+                    individual_task_vectors[donor_name] = task_vector
+                print(f"[Consensus Mask] Saved {len(individual_task_vectors)} individual task vectors for {len(keys_float)} parameters")
         
         dev = self.device
 
@@ -1369,17 +1549,8 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     
                     cache_key = (self.transform_type, seed_key, cur_D, proj_dim)
 
-                    if cache_key not in op_cache:
-                        fwd, lift = _fastfood_ops(
-                            cur_D,
-                            proj_dim,
-                            seed_key=seed_key,
-                            device=dev,
-                            transform_type=self.transform_type,
-                        )
-                        op_cache[cache_key] = (fwd, lift)
-                    else:
-                        fwd, lift = op_cache[cache_key]
+                    # Get projection operators (single or multi-sketch)
+                    fwd_ops, lift_ops = self._create_projection_operators(cur_D, proj_dim, seed_key, dev, op_cache)
 
                     # Collect all donor deltas
                     Xs: List[Tensor] = []
@@ -1390,43 +1561,76 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
                     # 🚀 OPTIMIZATION: Batch all donors into single GPU call
                     X_batch = torch.stack(Xs, dim=0).to(dev, non_blocking=True)  # [K, flat_dim]
-                    Y_batch = fwd(X_batch.view(-1, X_batch.shape[-1])).view(len(Xs), -1)  # [K, proj_dim]
-                    Ys = [Y_batch[i] for i in range(len(Xs))]
+                    
+                    # Multi-sketch: project with each sketch operator
+                    Y_sketches = self._multi_sketch_project(X_batch, fwd_ops)
 
                     if self.merge_where == "postlift":
-                        # 🚀 OPTIMIZATION: Batch lift operation
-                        Xhats_batch = lift(Y_batch.view(-1, Y_batch.shape[-1])).view(len(Xs), -1)  # [K, flat_dim]
-                        Xmerge = _zero_aware_aggregate(
-                            Xhats_batch,  # Already on GPU
-                            merge_func=self.merge_func,
-                            weights=w
-                            if self.merge_func
-                            in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"}
-                            else None,
-                            ema_task_order=self.ema_task_order,
-                            ema_gamma=self.ema_gamma,
-                            ema_w_c=self.ema_w_c,
-                            ema_w_s=self.ema_w_s,
-                            ema_custom_order=ema_custom_indices,
-                        ).to("cpu", non_blocking=True)
+                        # Lift each sketch, then merge in original space, then ensemble
+                        Xhats_sketches = []
+                        for Y_j, lift_j in zip(Y_sketches, lift_ops):
+                            Y_j_flat = Y_j.view(-1, Y_j.shape[-1])
+                            Xhats_j = lift_j(Y_j_flat).view(len(Xs), -1)  # [K, flat_dim]
+                            Xhats_sketches.append(Xhats_j)
+                        
+                        # Merge each sketch separately in original space
+                        Xmerge_sketches = []
+                        for Xhats_j in Xhats_sketches:
+                            Xmerge_j = _zero_aware_aggregate(
+                                Xhats_j,  # Already on GPU
+                                merge_func=self.merge_func,
+                                weights=w
+                                if self.merge_func
+                                in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"}
+                                else None,
+                                ema_task_order=self.ema_task_order,
+                                ema_gamma=self.ema_gamma,
+                                ema_w_c=self.ema_w_c,
+                                ema_w_s=self.ema_w_s,
+                                ema_custom_order=ema_custom_indices,
+                            )
+                            Xmerge_sketches.append(Xmerge_j)
+                        
+                        # Ensemble across sketches
+                        if self.num_sketches > 1:
+                            Xmerge_stacked = torch.stack(Xmerge_sketches, dim=0)
+                            if self.sketch_ensemble_mode == "mean":
+                                Xmerge = Xmerge_stacked.mean(dim=0)
+                            elif self.sketch_ensemble_mode == "sum":
+                                Xmerge = Xmerge_stacked.sum(dim=0)
+                            elif self.sketch_ensemble_mode == "max":
+                                Xmerge = Xmerge_stacked.abs().max(dim=0)[0] * torch.sign(Xmerge_stacked.sum(dim=0))
+                            elif self.sketch_ensemble_mode == "median":
+                                Xmerge = Xmerge_stacked.median(dim=0)[0]
+                        else:
+                            Xmerge = Xmerge_sketches[0]
+                        
+                        Xmerge = Xmerge.to("cpu", non_blocking=True)
                     else:
-                        Ymerge = _zero_aware_aggregate(
-                            Y_batch,  # Already on GPU
-                            merge_func=self.merge_func,
-                            weights=w
-                            if self.merge_func
-                            in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"}
-                            else None,
-                            ema_task_order=self.ema_task_order,
-                            ema_gamma=self.ema_gamma,
-                            ema_w_c=self.ema_w_c,
-                            ema_w_s=self.ema_w_s,
-                            ema_custom_order=ema_custom_indices,
-                        )
-                        Xmerge = lift(Ymerge).to("cpu", non_blocking=True)  # [flat_dim]
+                        # Merge in subspace for each sketch, then lift and ensemble
+                        Ymerge_sketches = []
+                        for Y_j in Y_sketches:
+                            Ymerge_j = _zero_aware_aggregate(
+                                Y_j,  # Already on GPU
+                                merge_func=self.merge_func,
+                                weights=w
+                                if self.merge_func
+                                in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"}
+                                else None,
+                                ema_task_order=self.ema_task_order,
+                                ema_gamma=self.ema_gamma,
+                                ema_w_c=self.ema_w_c,
+                                ema_w_s=self.ema_w_s,
+                                ema_custom_order=ema_custom_indices,
+                            )
+                            Ymerge_sketches.append(Ymerge_j)
+                        
+                        # Lift and ensemble
+                        Xmerge = self._multi_sketch_lift_and_ensemble(Ymerge_sketches, lift_ops).to("cpu", non_blocking=True)
 
                         if lift_err_den < 1e8:
-                            X0_rec = Xhats_batch[0] if self.merge_where == "postlift" else lift(Y_batch[0])
+                            # Use first sketch for error estimation
+                            X0_rec = lift_ops[0](Y_sketches[0][0:1]).view(-1)
                             diff = (X0_rec.to(torch.float32) - X_batch[0].to(torch.float32))
                             lift_err_num += float(diff.pow(2).sum().item())
                             lift_err_den += float(X_batch[0].pow(2).sum().item())
@@ -1485,17 +1689,8 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 
                 cache_key = (self.transform_type, seed_key, cur_D, proj_dim)
 
-                if cache_key not in op_cache:
-                    fwd, lift = _fastfood_ops(
-                        cur_D,
-                        proj_dim,
-                        seed_key=seed_key,
-                        device=dev,
-                        transform_type=self.transform_type,
-                    )
-                    op_cache[cache_key] = (fwd, lift)
-                else:
-                    fwd, lift = op_cache[cache_key]
+                # Get projection operators (single or multi-sketch)
+                fwd_ops, lift_ops = self._create_projection_operators(cur_D, proj_dim, seed_key, dev, op_cache)
 
                 # 🚀 OPTIMIZATION: Pre-allocate GPU buffers for this tensor
                 max_block_size = min(br, rows)
@@ -1510,8 +1705,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 # Pre-allocate GPU buffers
                 X_batch_gpu_buffer = torch.empty((len(donors_cpu), max_block_size, cur_D), 
                                                   dtype=torch.float32, device=dev)
-                Y_batch_gpu_buffer = torch.empty((len(donors_cpu), max_block_size, proj_dim), 
-                                                  dtype=torch.float32, device=dev)
+                # Note: For multi-sketch, we'll allocate Y buffers per-sketch on-demand
 
                 cursor = 0
                 tensor_changed = False
@@ -1538,47 +1732,98 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     X_batch_gpu_view.copy_(X_batch_view, non_blocking=True)
                     
                     X_batch_flat = X_batch_gpu_view.view(-1, X_batch_gpu_view.shape[-1])  # [K*take, d]
-                    Y_batch_flat = fwd(X_batch_flat)  # [K*take, m]
-                    Y_batch = Y_batch_flat.view(len(donors_cpu), take, -1)  # [K, take, m]
+                    
+                    # Multi-sketch: project with each sketch operator
+                    Y_sketches = []
+                    for fwd_j in fwd_ops:
+                        Y_j_flat = fwd_j(X_batch_flat)  # [K*take, m]
+                        Y_j = Y_j_flat.view(len(donors_cpu), take, -1)  # [K, take, m]
+                        Y_sketches.append(Y_j)
 
                     if self.merge_where == "postlift":
-                        # 🚀 OPTIMIZATION: Batch lift operation
-                        Xhats_batch_flat = lift(Y_batch_flat)  # [K*take, cur_D]
-                        Xhats_batch = Xhats_batch_flat.view(len(donors_cpu), take, -1)  # [K, take, cur_D]
-                        Xhats_batch = Xhats_batch[:, :, :d_last] if cur_D > d_last else Xhats_batch
-                        Xmerge = _zero_aware_aggregate(
-                            Xhats_batch,  # Already on GPU
-                            merge_func=self.merge_func,
-                            weights=w
-                            if self.merge_func
-                            in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"}
-                            else None,
-                            ema_task_order=self.ema_task_order,
-                            ema_gamma=self.ema_gamma,
-                            ema_w_c=self.ema_w_c,
-                            ema_w_s=self.ema_w_s,
-                            ema_custom_order=ema_custom_indices,
-                        ).to("cpu", non_blocking=True)
+                        # Lift each sketch, merge in original space, then ensemble
+                        Xmerge_sketches = []
+                        for Y_j, lift_j in zip(Y_sketches, lift_ops):
+                            Y_j_flat = Y_j.view(-1, Y_j.shape[-1])
+                            Xhats_j_flat = lift_j(Y_j_flat)  # [K*take, cur_D]
+                            Xhats_j = Xhats_j_flat.view(len(donors_cpu), take, -1)  # [K, take, cur_D]
+                            Xhats_j = Xhats_j[:, :, :d_last] if cur_D > d_last else Xhats_j
+                            
+                            Xmerge_j = _zero_aware_aggregate(
+                                Xhats_j,  # Already on GPU
+                                merge_func=self.merge_func,
+                                weights=w
+                                if self.merge_func
+                                in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"}
+                                else None,
+                                ema_task_order=self.ema_task_order,
+                                ema_gamma=self.ema_gamma,
+                                ema_w_c=self.ema_w_c,
+                                ema_w_s=self.ema_w_s,
+                                ema_custom_order=ema_custom_indices,
+                            )
+                            Xmerge_sketches.append(Xmerge_j)
+                        
+                        # Ensemble across sketches
+                        if self.num_sketches > 1:
+                            Xmerge_stacked = torch.stack(Xmerge_sketches, dim=0)
+                            if self.sketch_ensemble_mode == "mean":
+                                Xmerge = Xmerge_stacked.mean(dim=0)
+                            elif self.sketch_ensemble_mode == "sum":
+                                Xmerge = Xmerge_stacked.sum(dim=0)
+                            elif self.sketch_ensemble_mode == "max":
+                                Xmerge = Xmerge_stacked.abs().max(dim=0)[0] * torch.sign(Xmerge_stacked.sum(dim=0))
+                            elif self.sketch_ensemble_mode == "median":
+                                Xmerge = Xmerge_stacked.median(dim=0)[0]
+                        else:
+                            Xmerge = Xmerge_sketches[0]
+                        
+                        Xmerge = Xmerge.to("cpu", non_blocking=True)
                     else:
-                        Ymerge = _zero_aware_aggregate(
-                            Y_batch,  # Already on GPU, [K, take, m]
-                            merge_func=self.merge_func,
-                            weights=w
-                            if self.merge_func
-                            in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"}
-                            else None,
-                            ema_task_order=self.ema_task_order,
-                            ema_gamma=self.ema_gamma,
-                            ema_w_c=self.ema_w_c,
-                            ema_w_s=self.ema_w_s,
-                            ema_custom_order=ema_custom_indices,
-                        )
-                        Xmerge_full = lift(Ymerge).to("cpu", non_blocking=True)  # [take, cur_D]
-                        Xmerge = Xmerge_full[:, :d_last] if cur_D > d_last else Xmerge_full
+                        # Merge in subspace for each sketch, then lift and ensemble
+                        Ymerge_sketches = []
+                        for Y_j in Y_sketches:
+                            Ymerge_j = _zero_aware_aggregate(
+                                Y_j,  # Already on GPU, [K, take, m]
+                                merge_func=self.merge_func,
+                                weights=w
+                                if self.merge_func
+                                in {"sum", "mean", "ema", "ties_sum", "ties_mean", "ties_max"}
+                                else None,
+                                ema_task_order=self.ema_task_order,
+                                ema_gamma=self.ema_gamma,
+                                ema_w_c=self.ema_w_c,
+                                ema_w_s=self.ema_w_s,
+                                ema_custom_order=ema_custom_indices,
+                            )
+                            Ymerge_sketches.append(Ymerge_j)
+                        
+                        # Lift each sketch and ensemble
+                        Xmerge_full_sketches = []
+                        for Ymerge_j, lift_j in zip(Ymerge_sketches, lift_ops):
+                            Xmerge_full_j = lift_j(Ymerge_j)  # [take, cur_D]
+                            Xmerge_full_sketches.append(Xmerge_full_j)
+                        
+                        # Ensemble
+                        if self.num_sketches > 1:
+                            Xmerge_full_stacked = torch.stack(Xmerge_full_sketches, dim=0)
+                            if self.sketch_ensemble_mode == "mean":
+                                Xmerge_full = Xmerge_full_stacked.mean(dim=0)
+                            elif self.sketch_ensemble_mode == "sum":
+                                Xmerge_full = Xmerge_full_stacked.sum(dim=0)
+                            elif self.sketch_ensemble_mode == "max":
+                                Xmerge_full = Xmerge_full_stacked.abs().max(dim=0)[0] * torch.sign(Xmerge_full_stacked.sum(dim=0))
+                            elif self.sketch_ensemble_mode == "median":
+                                Xmerge_full = Xmerge_full_stacked.median(dim=0)[0]
+                        else:
+                            Xmerge_full = Xmerge_full_sketches[0]
+                        
+                        Xmerge = (Xmerge_full[:, :d_last] if cur_D > d_last else Xmerge_full).to("cpu", non_blocking=True)
 
                         if take > 0 and (lift_err_den < 1e8):
-                            X0_rec = Xhats_batch[0] if self.merge_where == "postlift" else lift(Y_batch[0])
-                            X0_orig = X_batch_gpu_view[0, :, :d_last] if cur_D > d_last else X_batch_gpu_view[0]
+                            # Use first sketch for error estimation
+                            X0_rec = Xmerge_full_sketches[0][0:1, :d_last] if cur_D > d_last else Xmerge_full_sketches[0][0:1]
+                            X0_orig = X_batch_gpu_view[0, :1, :d_last] if cur_D > d_last else X_batch_gpu_view[0, :1]
                             diff = (X0_rec.to(torch.float32) - X0_orig.to(torch.float32))
                             lift_err_num += float(diff.pow(2).sum().item())
                             lift_err_den += float(X0_orig.pow(2).sum().item())
@@ -1799,6 +2044,121 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             if not hasattr(self, '_runtime_info'):
                 self._runtime_info = {}
             self._runtime_info['lines_enabled'] = False
+
+        # ---------- Apply Subspace Boosting (if enabled) ----------
+        if self.use_subspace_boosting:
+            print("\n=== Applying Subspace Boosting ===")
+            with self.profile("subspace_boosting"):
+                # Compute task vectors for boosting
+                boosted_count = 0
+                skipped_count = 0
+                
+                for k in keys_float:
+                    # Only apply to linear layers (attention + MLP weights)
+                    if not self._is_linear_layer(k):
+                        skipped_count += 1
+                        continue
+                    
+                    # Only apply to 2D tensors (weight matrices)
+                    if base_cpu[k].ndim != 2:
+                        skipped_count += 1
+                        continue
+                    
+                    # Compute task vector: merged - base
+                    task_vector = base_cpu[k].float() - original_base_cpu[k].float()
+                    
+                    # Apply subspace boosting
+                    boosted_tv = subspace_boosting(task_vector, beta=self.subspace_boosting_beta)
+                    
+                    # Reconstruct parameter: base + boosted_task_vector
+                    base_cpu[k] = (original_base_cpu[k].float() + boosted_tv).to(original_base_cpu[k].dtype)
+                    boosted_count += 1
+                
+                print(f"[Subspace Boosting] Beta: {self.subspace_boosting_beta:.4f}")
+                print(f"[Subspace Boosting] Boosted {boosted_count} linear layer weights")
+                print(f"[Subspace Boosting] Skipped {skipped_count} non-linear/non-2D parameters")
+                
+                # Store SB metadata for reporting
+                if not hasattr(self, '_runtime_info'):
+                    self._runtime_info = {}
+                self._runtime_info['subspace_boosting_enabled'] = True
+                self._runtime_info['subspace_boosting_beta'] = float(self.subspace_boosting_beta)
+                self._runtime_info['subspace_boosting_count'] = int(boosted_count)
+                print("=" * 50)
+        else:
+            # SB not enabled - add runtime info to indicate this
+            if not hasattr(self, '_runtime_info'):
+                self._runtime_info = {}
+            self._runtime_info['subspace_boosting_enabled'] = False
+
+        # ---------- Apply Consensus Masking with TALL Masks (if enabled) ----------
+        if self.use_consensus_mask:
+            print("\n=== Applying Consensus Masking (TALL Masks) ===")
+            with self.profile("consensus_masking"):
+                # Compute merged task vector: merged - base
+                merged_task_vector = {}
+                for k in keys_float:
+                    merged_task_vector[k] = base_cpu[k].float() - original_base_cpu[k].float()
+                
+                # Generate per-task TALL masks
+                print(f"[Consensus Mask] Generating task-specific masks with λ={self.tall_mask_lambda:.2f}")
+                tall_masks = generate_tall_masks(
+                    merged_delta=merged_task_vector,
+                    individual_deltas=individual_task_vectors,
+                    base_state=original_base_cpu,
+                    tall_mask_lambda=self.tall_mask_lambda,
+                )
+                
+                # Count mask statistics
+                total_params = sum(v.numel() for v in merged_task_vector.values())
+                task_activation_counts = {
+                    task_name: sum(mask.sum().item() for mask in task_mask.values())
+                    for task_name, task_mask in tall_masks.items()
+                }
+                
+                print(f"[Consensus Mask] Generated masks for {len(tall_masks)} tasks")
+                print(f"[Consensus Mask] Total parameters: {total_params:,}")
+                for task_name, count in task_activation_counts.items():
+                    activation_pct = 100.0 * count / total_params if total_params > 0 else 0.0
+                    print(f"[Consensus Mask]   - {task_name}: {int(count):,} active ({activation_pct:.1f}%)")
+                
+                # Apply consensus filtering
+                print(f"\n[Consensus Mask] Applying consensus threshold: {self.consensus_threshold}")
+                filtered_delta = apply_consensus_mask(
+                    merged_delta=merged_task_vector,
+                    tall_masks=tall_masks,
+                    consensus_threshold=self.consensus_threshold,
+                )
+                
+                # Reconstruct final model: base + filtered_delta
+                for k in keys_float:
+                    base_cpu[k] = (original_base_cpu[k].float() + filtered_delta[k]).to(original_base_cpu[k].dtype)
+                
+                # Count consensus mask statistics
+                consensus_count = sum(
+                    ((filtered_delta[k] != 0).sum().item() if k in filtered_delta else 0)
+                    for k in keys_float
+                )
+                consensus_pct = 100.0 * consensus_count / total_params if total_params > 0 else 0.0
+                
+                print(f"[Consensus Mask] Retained {consensus_count:,} parameters ({consensus_pct:.1f}%)")
+                print(f"[Consensus Mask] Pruned {total_params - consensus_count:,} parameters ({100.0 - consensus_pct:.1f}%)")
+                
+                # Store metadata for reporting
+                if not hasattr(self, '_runtime_info'):
+                    self._runtime_info = {}
+                self._runtime_info['consensus_mask_enabled'] = True
+                self._runtime_info['tall_mask_lambda'] = float(self.tall_mask_lambda)
+                self._runtime_info['consensus_threshold'] = int(self.consensus_threshold)
+                self._runtime_info['task_activation_counts'] = {k: int(v) for k, v in task_activation_counts.items()}
+                self._runtime_info['consensus_retained_count'] = int(consensus_count)
+                self._runtime_info['consensus_retained_pct'] = float(consensus_pct)
+                print("=" * 50)
+        else:
+            # Consensus masking not enabled
+            if not hasattr(self, '_runtime_info'):
+                self._runtime_info = {}
+            self._runtime_info['consensus_mask_enabled'] = False
 
         # ---------- Load merged state back ----------
         if isinstance(base_model, nn.Module):

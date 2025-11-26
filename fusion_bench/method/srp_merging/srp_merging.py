@@ -14,8 +14,8 @@ from fusion_bench.modelpool import BaseModelPool
 from fusion_bench.utils.type import StateDictType
 from fusion_bench.utils.state_dict_arithmetic import state_dict_add, state_dict_sub, state_dict_mul
 
-# Import utilities from fastfood_utils
-from .fastfood_utils import (
+# Import utilities from srp_utils
+from .srp_utils import (
     EPS,
     create_projection_ops,
     create_multi_sketch_ops,
@@ -37,7 +37,7 @@ from .projection_size_estimator import (
 )
 
 # Keep a local alias for clarity
-_fastfood_ops = create_projection_ops
+_srp_ops = create_projection_ops
 _multi_sketch_ops = create_multi_sketch_ops
 _zero_aware_aggregate = zero_aware_aggregate
 _layer_key = layer_key
@@ -45,9 +45,9 @@ _layer_key = layer_key
 
 # ------------------ Algorithm ------------------
 @auto_register_config
-class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
+class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
     """
-    Task-vector merging via structured subspace projections (SRHT/FWHT/DCT/DHT).
+    Task-vector merging via structured random projections (SRP) using SRHT/FWHT/DCT/DHT.
 
     Controls:
       subspace_scope: "per_tensor" | "per_flat_tensor" | "layer" | "global"
@@ -477,7 +477,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         """
         import json
         from pathlib import Path
-        from fusion_bench.method.fastfood_merging.projection_size_estimator import (
+        from fusion_bench.method.srp_merging.projection_size_estimator import (
             compute_layer_progressive_ratio,
             compute_layer_group_ratio,
         )
@@ -892,7 +892,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             cache_key = (self.transform_type, seed_key, cur_D, proj_dim)
             
             if cache_key not in op_cache:
-                fwd, lift = _fastfood_ops(
+                fwd, lift = _srp_ops(
                     cur_D,
                     proj_dim,
                     seed_key=seed_key,
@@ -1225,7 +1225,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
                 print("=" * 50 + "\n")
 
-                print("[Task Arithmetic] Reconstruction test complete, skipping normal Fastfood merging")
+                print("[Task Arithmetic] Reconstruction test complete, skipping normal SRP merging")
                 merged_tensors = len(keys_float_ta) if self.report_reconstruction_error or self.proj_ratio < 1.0 else 0
                 changed_params = merged_tensors
 
@@ -2245,16 +2245,16 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             parts.append("ties")
 
         if parts:
-            return f"fastfood_{'_'.join(parts)}"
+            return f"srp_{'_'.join(parts)}"
         else:
-            return "fastfood_default"
+            return "srp_default"
 
     def _run_merged_task_vector_analysis(self, modelpool: BaseModelPool, method_id: str):
         try:
             from fusion_bench.method.analysis.merged_task_vector_analysis import MergedTaskVectorAnalysis
 
             analyzer = MergedTaskVectorAnalysis(
-                merging_methods=["fastfood_merging"],
+                merging_methods=["srp_merging"],
                 proj_ratio=self.proj_ratio,
                 use_G=self.use_G,
                 merge_func=self.merge_func,

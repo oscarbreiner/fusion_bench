@@ -13,8 +13,8 @@ from fusion_bench.mixins import SimpleProfilerMixin, auto_register_config
 from fusion_bench.modelpool import BaseModelPool
 from fusion_bench.utils.type import StateDictType
 
-# Import utilities from fastfood_utils
-from .fastfood_utils import (
+# Import utilities from srp_utils
+from ..srp_utils import (
     EPS,
     create_projection_ops,
     zero_aware_aggregate,

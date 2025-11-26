@@ -27,8 +27,8 @@ from fusion_bench.mixins.lightning_fabric import LightningFabricMixin
 from fusion_bench.mixins.simple_profiler import SimpleProfilerMixin
 
 # we import only utils that don't affect differentiability paths
-from .fastfood_utils import layer_key, seed_from_string
-from .structured_projection import next_pow2, fwht_inplace_ortho
+from ..srp_utils import layer_key, seed_from_string
+from ..structured_projection import next_pow2, fwht_inplace_ortho
 
 log = logging.getLogger(__name__)
 

@@ -1,12 +1,12 @@
 # ============================================================================
-# FastFood Subspace Merging Configuration
+# Structured Random Projection (SRP) Subspace Merging Configuration
 # Supports multiple merging functions including EMA with adaptive β_t
 # ============================================================================
 
-_target_: fusion_bench.method.fastfood_merging.FastfoodSubspaceMergeAlgorithm
+_target_: fusion_bench.method.srp_merging.SRPSubspaceMergeAlgorithm
 
 # ============================================================================
-# Core FastFood Parameters
+# Core SRP Parameters
 # ============================================================================
 proj_ratio: 0.75              # Subspace compression ratio (0.0-1.0)
 use_G: false                  # Use Gaussian scaling in FastFood transform
@@ -89,8 +89,8 @@ weight_matching_input_shapes: # Custom input shapes for permutation spec generat
 # ============================================================================
 # Subspace Configuration
 # ============================================================================
-subspace_scope: "global"     # per_tensor | per_flat_tensor | layer | global
-                              # - per_tensor: row-wise projection (standard)
+subspace_scope: "per_tensor"  # per_tensor | per_flat_tensor | layer | global
+                              # - per_tensor: row-wise projection (standard, recommended)
                               # - per_flat_tensor: flatten 2D to (out*in), one projection
                               # - layer: layer-wise shared projection
                               # - global: single global projection for all params

@@ -1,6 +1,6 @@
 """
-Utility functions for FWHT/SRHT/DCT/DHT/Fastfood-based subspace projections
-and model-merge helpers (TIES/EMA/etc.).
+Utility functions for structured random projection (SRP) based subspace merging.
+Supports FWHT/SRHT/DCT/DHT/Fastfood transforms and model-merge helpers (TIES/EMA/etc.).
 
 Main API:
 - create_projection_ops(...): Build projection (fwd) and lifting (lift) operators

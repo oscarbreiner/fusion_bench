@@ -1,6 +1,6 @@
 # projection_size_estimator.py
 """
-Projection Size Estimator for Fastfood Subspace Merging
+Projection Size Estimator for Structured Random Projection (SRP) Subspace Merging
 
 This module provides adaptive projection size estimation for subspace merging operations.
 Supports two modes:

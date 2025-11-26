@@ -6,3 +6,15 @@ threshold: 20
 remove_keys: []
 # Function to merge the models, default is sum. Options are 'sum', 'mean', and 'max'
 merge_func: sum
+
+# Post-processing options
+# Subspace Boosting: Restore rank to collapsed task vectors
+use_subspace_boosting: false
+subspace_boosting_beta: 0.01  # Cumulative energy threshold (0.0-1.0, typical: 0.01-0.08)
+
+# LiNeS: Layer-wise progressive scaling
+use_lines: false
+lines_num_blocks: null  # Auto-detect from model (12 for ViT-B, 24 for ViT-L)
+lines_alpha: null  # Auto-compute from norm ratios if null
+lines_beta: 1.0  # Maximum scaling factor for deepest layers
+lines_auto_alpha: true  # Whether to auto-compute alpha

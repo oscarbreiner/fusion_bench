@@ -55,6 +55,7 @@ __all__ = [
     "conflict_gating",
     "elect_then_avg",
     "soft_signmax",
+    "signmax_mad_normalized",
     "align_weighted_mean",
     "coherence_penalized_weights",
     "orthogonal_deflation_merge",
@@ -633,6 +634,77 @@ def soft_signmax(U: Tensor, T: float = 0.25) -> Tensor:
     return (W * U).sum(dim=0)
 
 @torch.no_grad()
+def signmax_mad_normalized(U: Tensor, T: float = 0.5, eps: float = 1e-8) -> Tensor:
+    """
+    SignMax with MAD normalization and temperature-controlled softmax voting.
+    
+    Prevents high-magnitude experts from dominating by normalizing each expert
+    by its Median Absolute Deviation (MAD) before voting. More robust than
+    standard normalization when experts have different scales or outliers.
+    
+    Algorithm:
+        1. Normalize each expert by MAD: U_norm[k] = U[k] / (MAD(U[k]) + eps)
+        2. Elect sign by majority voting on normalized experts
+        3. Compute temperature-scaled scores for sign-consistent experts
+        4. Weight original (unnormalized) experts by softmax of scores
+    
+    Args:
+        U: Stacked expert tensors [K, M] where K = num_experts, M = num_parameters
+        T: Temperature parameter for softmax (lower = more selective)
+           - Small T (e.g., 0.1): Pick single dominant expert (arg-max like)
+           - Medium T (e.g., 0.25): Balanced weighting
+           - Large T (e.g., 1.0): Nearly uniform weighting
+        eps: Small constant to avoid division by zero
+        
+    Returns:
+        Merged expert tensor [M] with MAD-normalized voting and temperature-scaled weighting
+        
+    Benefits vs standard SignMax:
+        - MAD normalization is robust to outliers (vs mean/std)
+        - Equal voting power for all experts regardless of magnitude
+        - Temperature control over selection vs averaging trade-off
+        - Fully vectorized (no Python loops)
+        
+    Example:
+        >>> U = torch.randn(5, 1000)  # 5 experts, 1000 parameters
+        >>> merged = signmax_mad_normalized(U, T=0.25)  # Balanced temperature
+    """
+    K, M = U.shape
+    
+    # Step 1: Compute MAD for each expert (vectorized)
+    # MAD = median(|X - median(X)|)
+    medians = U.median(dim=1, keepdim=True)[0]  # [K, 1]
+    abs_deviations = (U - medians).abs()  # [K, M]
+    mad = abs_deviations.median(dim=1, keepdim=True)[0]  # [K, 1]
+    
+    # Normalize by MAD
+    U_norm = U / (mad + eps)  # [K, M]
+    
+    # Step 2: Elect sign by majority voting on normalized experts
+    sgn_sum = torch.sign(U_norm).sum(dim=0)  # [M]
+    elected = torch.where(sgn_sum >= 0, 1.0, -1.0)  # [M]
+    
+    # Step 3: Identify sign-consistent experts
+    same = (torch.sign(U_norm) == elected.unsqueeze(0))  # [K, M]
+    
+    # Step 4: Compute temperature-scaled scores based on vote margin
+    # Vote margin = how strongly each expert agrees with elected sign (signed magnitude)
+    # For elected=+1: margin = U_norm (positive values favor election)
+    # For elected=-1: margin = -U_norm (negative values favor election, flipped to positive)
+    # Softmax temperature: softmax(margin/T) - smaller T = peakier, larger T = more uniform
+    vote_margin = U_norm * elected.unsqueeze(0)  # [K, M] - positive when agreeing with election
+    scores = vote_margin / max(T, 1e-6)  # [K, M]
+    scores[~same] = -float("inf")  # Mask out sign-inconsistent experts
+    
+    # Step 5: Softmax weighting
+    W = torch.softmax(scores, dim=0)  # [K, M]
+    W = torch.nan_to_num(W, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # Step 6: Apply weights to ORIGINAL (unnormalized) experts
+    # This preserves the actual parameter magnitudes
+    return (W * U).sum(dim=0)  # [M]
+
+@torch.no_grad()
 def align_weighted_mean(U: Tensor, gamma: float = 2.0, clip_neg: bool = True, eps: float = 1e-8) -> Tensor:
     K, M = U.shape
     c = U.mean(dim=0)
@@ -959,7 +1031,7 @@ def zero_aware_aggregate(
         "sum", "mean", "max", "signmax", "ema",
         "ties_sum", "ties_mean", "ties_max",
         "energy_equalize", "variance_aware", "subspace_whiten",
-        "conflict_gating", "elect_then_avg", "soft_signmax",
+        "conflict_gating", "elect_then_avg", "soft_signmax", "signmax_mad_normalized",
         "align_weighted_mean", "coherence_penalized", "orthogonal_deflation",
         "odm_ema_tuning_free"
     }
@@ -1059,6 +1131,10 @@ def zero_aware_aggregate(
     if mf == "soft_signmax":
         T = kwargs.get("soft_signmax_temperature", 0.25)
         return soft_signmax(U_flat, T=T).view(orig_shape)
+
+    if mf == "signmax_mad_normalized":
+        T = kwargs.get("signmax_mad_temperature", 0.5)
+        return signmax_mad_normalized(U_flat, T=T, eps=kwargs.get("eps", 1e-8)).view(orig_shape)
 
     if mf == "align_weighted_mean":
         gamma = kwargs.get("awm_gamma", 2.0)

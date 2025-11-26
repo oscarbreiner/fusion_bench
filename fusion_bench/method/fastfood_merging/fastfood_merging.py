@@ -1391,8 +1391,11 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             base_cpu = {k: v.detach().cpu() for k, v in base_sd.items()}
             donors_cpu = [{k: v.detach().cpu() for k, v in d.items()} for d in donors_sd]
         
-        # Save original base for LiNeS and Consensus Mask if needed
-        if self.use_lines or self.use_consensus_mask:
+        # Save original base for post-processing (SB, LiNeS, Consensus Mask)
+        # Always save if any post-processing is enabled
+        if self.use_subspace_boosting or self.use_lines or self.use_consensus_mask:
+            if self.use_subspace_boosting:
+                print("\n[Subspace Boosting] Saving original base model for post-processing")
             if self.use_lines:
                 print("\n[LiNeS] Saving original base model for post-processing")
             if self.use_consensus_mask:
@@ -1485,6 +1488,10 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         # Small sample for lift error (subspace only)
         lift_err_num = 0.0
         lift_err_den = 0.0
+        
+        # Store merged deltas instead of modifying base_cpu in-place
+        # This is more efficient when post-processing is enabled
+        merged_delta = {}
 
         with self.profile("merging models"):
             # ---------- Process non-linear weights (1D) with mean in original space ----------
@@ -1493,14 +1500,16 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     f"[Merging non-linear weights] Processing {len(keys_nonlinear)} non-linear tensors with mean in original space"
                 )
                 for name in keys_nonlinear:
-                    result = base_cpu[name].clone().float()
+                    base_val = base_cpu[name].float()
+                    result = base_val.clone()
                     for i, dsd in enumerate(donors_cpu):
                         donor_val = dsd[name].float()
                         result += (donor_val - result) / (i + 2)
-                    update = (result - base_cpu[name].float()) * self.scale
-                    base_cpu[name].add_(update.to(base_cpu[name].dtype))
+                    # Store delta instead of modifying base_cpu
+                    delta = (result - base_val) * self.scale
+                    merged_delta[name] = delta
                     merged_tensors += 1
-                    if update.abs().max().item() > 0:
+                    if delta.abs().max().item() > 0:
                         changed_params += 1
 
             # ---------- Process linear weights (2D) with projection ----------
@@ -1644,7 +1653,8 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         scale_factor = (max_ratio * base_norm) / (upd_norm + 1e-12)
                         upd = upd * scale_factor
 
-                    tb.add_(upd)
+                    # Store delta instead of modifying base_cpu
+                    merged_delta[name] = upd.float()
 
                     merged_tensors += 1
                     if upd.abs().max().item() > 0:
@@ -1707,6 +1717,9 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                                                   dtype=torch.float32, device=dev)
                 # Note: For multi-sketch, we'll allocate Y buffers per-sketch on-demand
 
+                # Allocate delta accumulator for this tensor
+                delta_accumulator = torch.zeros_like(vb)
+                
                 cursor = 0
                 tensor_changed = False
 
@@ -1837,10 +1850,13 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         scale_factor = (max_ratio * base_norm) / (upd_norm + 1e-12)
                         upd = upd * scale_factor
 
-                    vb[cursor : cursor + take, :].add_(upd)
+                    # Accumulate delta instead of modifying base_cpu in-place
+                    delta_accumulator[cursor : cursor + take, :].add_(upd)
                     tensor_changed = tensor_changed or bool(upd.abs().max().item() > 0)
                     cursor += take
 
+                # Store accumulated delta for this tensor
+                merged_delta[name] = delta_accumulator
                 merged_tensors += 1
                 if tensor_changed:
                     changed_params += 1
@@ -1848,52 +1864,17 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             # 🚀 OPTIMIZATION: Removed torch.cuda.empty_cache() from hot loop
             # (expensive operation, rarely beneficial, adds ~5-10% overhead)
 
-        # ---------- Stats / sanity ----------
-        bad, total_float = [], 0
-        for n, p in base_cpu.items():
-            if not torch.is_floating_point(p):
-                continue
-            total_float += 1
-            if torch.isnan(p).any() or torch.isinf(p).any():
-                bad.append(n)
-
-        drift_hi, drift_lo = [], []
-        for k in keys_float:
-            pre = base_sd[k].float()
-            now = base_cpu[k].float()
-            nb = float(pre.norm().item()) + 1e-12
-            na = float(now.norm().item())
-            ratio = na / nb
-            if ratio > 10.0:
-                drift_hi.append((k, ratio))
-            elif ratio < 0.1:
-                drift_lo.append((k, ratio))
-
-        drift_hi.sort(key=lambda x: x[1], reverse=True)
-        drift_lo.sort(key=lambda x: x[1])
-
-        print("\n=== Merge Summary ===")
+        # ---------- Early Summary (before post-processing) ----------
+        print("\n=== Merge Summary (Pre-Processing) ===")
         print(
             f"[Summary] donors={K} | eligible_tensors={len(keys_float)} | processed={merged_tensors} | changed_tensors={changed_params}"
         )
-        if bad:
-            print(f"[Summary] ⚠️ NaN/Inf in {len(bad)}/{total_float} float tensors (showing up to 10):")
-            for n in bad[:10]:
-                print("  -", n)
-        else:
-            print(f"[Summary] ✓ No NaN/Inf across {total_float} float tensors.")
 
         if self.merge_where == "subspace" and lift_err_den > 0:
             rel = math.sqrt(lift_err_num) / (math.sqrt(lift_err_den) + EPS)
             print(f"[Summary] Lift reconstruction rel. error (Fro): {rel:.6f}")
         else:
             print("[Summary] Lift reconstruction error: N/A (postlift mixing or no samples).")
-
-        print(f"[Summary] Large ↑ drift (>10x): {len(drift_hi)} | Large ↓ drift (<0.1x): {len(drift_lo)}")
-        for name, r in drift_hi[:8]:
-            print(f"   HI  {r:.3f}  {name}")
-        for name, r in drift_lo[:8]:
-            print(f"   LO  {r:.3f}  {name}")
 
         self.print_profile_summary()
 
@@ -1985,22 +1966,68 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 import traceback
                 traceback.print_exc()
 
-        # ---------- Apply LiNeS Scaling (Layer Scaling) ----------
+        # ========================================================================
+        # Post-processing Pipeline (Correct Order)
+        # ========================================================================
+        # 1. merged_delta already computed during merging (no need to recompute)
+        # 2. Apply Subspace Boosting (SB) to merged_delta
+        # 3. Apply LiNeS scaling to boosted merged_delta
+        # 4. Apply Consensus Masking to scaled+boosted merged_delta
+        # 5. Final model = base + processed_delta
+        # ========================================================================
+        
+        # Note: merged_delta already exists from the merging phase above
+        # We just need to apply post-processing if enabled
+        print(f"\n[Merged Delta] Task vector ready with {len(merged_delta)} parameters")
+        
+        # Step 2: Apply Subspace Boosting (if enabled)
+        if self.use_subspace_boosting:
+            print("\n=== Applying Subspace Boosting ===")
+            with self.profile("subspace_boosting"):
+                boosted_count = 0
+                skipped_count = 0
+                
+                for k in keys_float:
+                    # Only apply to linear layers (attention + MLP weights)
+                    if not self._is_linear_layer(k):
+                        skipped_count += 1
+                        continue
+                    
+                    # Only apply to 2D tensors (weight matrices)
+                    if merged_delta[k].ndim != 2:
+                        skipped_count += 1
+                        continue
+                    
+                    # Apply subspace boosting to the merged task vector
+                    merged_delta[k] = subspace_boosting(merged_delta[k], beta=self.subspace_boosting_beta)
+                    boosted_count += 1
+                
+                print(f"[Subspace Boosting] Beta: {self.subspace_boosting_beta:.4f}")
+                print(f"[Subspace Boosting] Boosted {boosted_count} linear layer weights")
+                print(f"[Subspace Boosting] Skipped {skipped_count} non-linear/non-2D parameters")
+                
+                # Store SB metadata for reporting
+                if not hasattr(self, '_runtime_info'):
+                    self._runtime_info = {}
+                self._runtime_info['subspace_boosting_enabled'] = True
+                self._runtime_info['subspace_boosting_beta'] = float(self.subspace_boosting_beta)
+                self._runtime_info['subspace_boosting_count'] = int(boosted_count)
+                print("=" * 50)
+        else:
+            # SB not enabled - add runtime info to indicate this
+            if not hasattr(self, '_runtime_info'):
+                self._runtime_info = {}
+            self._runtime_info['subspace_boosting_enabled'] = False
+        
+        # Step 3: Apply LiNeS Scaling (if enabled)
         if self.use_lines:
             print("\n=== Applying LiNeS (Layer Scaling) ===")
             with self.profile("lines_scaling"):
-                # Compute merged delta: delta = merged_model - base_model
-                merged_delta = {}
-                norm_summed_tvs = 0.0
-                norm_merged_tv = 0.0
-                
-                for k in keys_float:
-                    delta = base_cpu[k].float() - original_base_cpu[k].float()
-                    merged_delta[k] = delta
-                    norm_merged_tv += delta.abs().sum().item()
+                # Compute norm of merged delta
+                norm_merged_tv = sum(delta.abs().sum().item() for delta in merged_delta.values())
                 
                 # Compute norm of summed task vectors (for auto alpha)
-                # summed_tv = sum of all individual task vectors
+                norm_summed_tvs = 0.0
                 for k in keys_float:
                     base_val = original_base_cpu[k].float()
                     for dsd in donors_cpu:
@@ -2011,8 +2038,8 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 print(f"[LiNeS] Merged delta L1 norm: {norm_merged_tv:.6e}")
                 print(f"[LiNeS] Summed task vectors L1 norm: {norm_summed_tvs:.6e}")
                 
-                # Apply LiNeS scaling to the merged delta
-                scaled_delta, computed_alpha = self._apply_lines_scaling(
+                # Apply LiNeS scaling to the merged delta (already boosted if SB enabled)
+                merged_delta, computed_alpha = self._apply_lines_scaling(
                     merged_delta,
                     num_tasks=len(donors_cpu),
                     norm_summed_tvs=norm_summed_tvs,
@@ -2033,11 +2060,7 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 self._runtime_info['lines_num_blocks'] = int(self._lines_num_blocks_used)
                 self._runtime_info['lines_auto_alpha'] = bool(self.lines_auto_alpha)
                 
-                # Reconstruct final model: base + scaled_delta
-                for k in keys_float:
-                    base_cpu[k] = (original_base_cpu[k].float() + scaled_delta[k]).to(original_base_cpu[k].dtype)
-                
-                print(f"[LiNeS] Applied layer-wise scaling to {len(scaled_delta)} parameters")
+                print(f"[LiNeS] Applied layer-wise scaling to {len(merged_delta)} parameters")
                 print("=" * 50)
         else:
             # LiNeS not enabled - add runtime info to indicate this
@@ -2045,72 +2068,21 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 self._runtime_info = {}
             self._runtime_info['lines_enabled'] = False
 
-        # ---------- Apply Subspace Boosting (if enabled) ----------
-        if self.use_subspace_boosting:
-            print("\n=== Applying Subspace Boosting ===")
-            with self.profile("subspace_boosting"):
-                # Compute task vectors for boosting
-                boosted_count = 0
-                skipped_count = 0
-                
-                for k in keys_float:
-                    # Only apply to linear layers (attention + MLP weights)
-                    if not self._is_linear_layer(k):
-                        skipped_count += 1
-                        continue
-                    
-                    # Only apply to 2D tensors (weight matrices)
-                    if base_cpu[k].ndim != 2:
-                        skipped_count += 1
-                        continue
-                    
-                    # Compute task vector: merged - base
-                    task_vector = base_cpu[k].float() - original_base_cpu[k].float()
-                    
-                    # Apply subspace boosting
-                    boosted_tv = subspace_boosting(task_vector, beta=self.subspace_boosting_beta)
-                    
-                    # Reconstruct parameter: base + boosted_task_vector
-                    base_cpu[k] = (original_base_cpu[k].float() + boosted_tv).to(original_base_cpu[k].dtype)
-                    boosted_count += 1
-                
-                print(f"[Subspace Boosting] Beta: {self.subspace_boosting_beta:.4f}")
-                print(f"[Subspace Boosting] Boosted {boosted_count} linear layer weights")
-                print(f"[Subspace Boosting] Skipped {skipped_count} non-linear/non-2D parameters")
-                
-                # Store SB metadata for reporting
-                if not hasattr(self, '_runtime_info'):
-                    self._runtime_info = {}
-                self._runtime_info['subspace_boosting_enabled'] = True
-                self._runtime_info['subspace_boosting_beta'] = float(self.subspace_boosting_beta)
-                self._runtime_info['subspace_boosting_count'] = int(boosted_count)
-                print("=" * 50)
-        else:
-            # SB not enabled - add runtime info to indicate this
-            if not hasattr(self, '_runtime_info'):
-                self._runtime_info = {}
-            self._runtime_info['subspace_boosting_enabled'] = False
-
-        # ---------- Apply Consensus Masking with TALL Masks (if enabled) ----------
+        # Step 4: Apply Consensus Masking (if enabled)
         if self.use_consensus_mask:
             print("\n=== Applying Consensus Masking (TALL Masks) ===")
             with self.profile("consensus_masking"):
-                # Compute merged task vector: merged - base
-                merged_task_vector = {}
-                for k in keys_float:
-                    merged_task_vector[k] = base_cpu[k].float() - original_base_cpu[k].float()
-                
-                # Generate per-task TALL masks
+                # Generate per-task TALL masks using the merged delta (already boosted+scaled)
                 print(f"[Consensus Mask] Generating task-specific masks with λ={self.tall_mask_lambda:.2f}")
                 tall_masks = generate_tall_masks(
-                    merged_delta=merged_task_vector,
+                    merged_delta=merged_delta,
                     individual_deltas=individual_task_vectors,
                     base_state=original_base_cpu,
                     tall_mask_lambda=self.tall_mask_lambda,
                 )
                 
                 # Count mask statistics
-                total_params = sum(v.numel() for v in merged_task_vector.values())
+                total_params = sum(v.numel() for v in merged_delta.values())
                 task_activation_counts = {
                     task_name: sum(mask.sum().item() for mask in task_mask.values())
                     for task_name, task_mask in tall_masks.items()
@@ -2122,21 +2094,17 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     activation_pct = 100.0 * count / total_params if total_params > 0 else 0.0
                     print(f"[Consensus Mask]   - {task_name}: {int(count):,} active ({activation_pct:.1f}%)")
                 
-                # Apply consensus filtering
+                # Apply consensus filtering to the merged delta
                 print(f"\n[Consensus Mask] Applying consensus threshold: {self.consensus_threshold}")
-                filtered_delta = apply_consensus_mask(
-                    merged_delta=merged_task_vector,
+                merged_delta = apply_consensus_mask(
+                    merged_delta=merged_delta,
                     tall_masks=tall_masks,
                     consensus_threshold=self.consensus_threshold,
                 )
                 
-                # Reconstruct final model: base + filtered_delta
-                for k in keys_float:
-                    base_cpu[k] = (original_base_cpu[k].float() + filtered_delta[k]).to(original_base_cpu[k].dtype)
-                
                 # Count consensus mask statistics
                 consensus_count = sum(
-                    ((filtered_delta[k] != 0).sum().item() if k in filtered_delta else 0)
+                    ((merged_delta[k] != 0).sum().item() if k in merged_delta else 0)
                     for k in keys_float
                 )
                 consensus_pct = 100.0 * consensus_count / total_params if total_params > 0 else 0.0
@@ -2159,6 +2127,53 @@ class FastfoodSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             if not hasattr(self, '_runtime_info'):
                 self._runtime_info = {}
             self._runtime_info['consensus_mask_enabled'] = False
+        
+        # Step 5: Reconstruct final model from processed delta
+        print("\n=== Reconstructing Final Model ===")
+        for k in keys_float:
+            if k in merged_delta:
+                # Apply the (possibly post-processed) delta to base model
+                base_cpu[k] = (base_cpu[k].float() + merged_delta[k]).to(base_cpu[k].dtype)
+        print(f"[Reconstruction] Applied processed delta to {len(merged_delta)} parameters")
+
+        # ---------- Post-reconstruction Stats / Sanity Check ----------
+        bad, total_float = [], 0
+        for n, p in base_cpu.items():
+            if not torch.is_floating_point(p):
+                continue
+            total_float += 1
+            if torch.isnan(p).any() or torch.isinf(p).any():
+                bad.append(n)
+
+        drift_hi, drift_lo = [], []
+        for k in keys_float:
+            pre = base_sd[k].float()
+            now = base_cpu[k].float()
+            nb = float(pre.norm().item()) + 1e-12
+            na = float(now.norm().item())
+            ratio = na / nb
+            if ratio > 10.0:
+                drift_hi.append((k, ratio))
+            elif ratio < 0.1:
+                drift_lo.append((k, ratio))
+
+        drift_hi.sort(key=lambda x: x[1], reverse=True)
+        drift_lo.sort(key=lambda x: x[1])
+
+        print("\n=== Final Model Statistics ===")
+        if bad:
+            print(f"[Stats] ⚠️ NaN/Inf in {len(bad)}/{total_float} float tensors (showing up to 10):")
+            for n in bad[:10]:
+                print("  -", n)
+        else:
+            print(f"[Stats] ✓ No NaN/Inf across {total_float} float tensors.")
+
+        print(f"[Stats] Large ↑ drift (>10x): {len(drift_hi)} | Large ↓ drift (<0.1x): {len(drift_lo)}")
+        for name, r in drift_hi[:8]:
+            print(f"   HI  {r:.3f}  {name}")
+        for name, r in drift_lo[:8]:
+            print(f"   LO  {r:.3f}  {name}")
+
 
         # ---------- Load merged state back ----------
         if isinstance(base_model, nn.Module):

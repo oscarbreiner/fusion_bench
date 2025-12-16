@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import hashlib
 import warnings
-from typing import List, Tuple, Callable, Literal
+from typing import List, Tuple, Callable, Literal, Dict
 
 import numpy as np
 from scipy.fft import dct as sp_dct, idct as sp_idct
@@ -47,6 +47,7 @@ __all__ = [
     "resolve_sign",
     "ties_disjoint_merge",
     "ties_merge_subspace",
+    "random_merge_subspace",
     "ema_adaptive_beta",
     "ema_merge_subspace",
     "energy_equalize",
@@ -63,6 +64,11 @@ __all__ = [
     "subspace_boosting",
     "generate_tall_masks",
     "apply_consensus_mask",
+    # TSV-Merge inspired methods
+    "merge_consensus_whiten",
+    "merge_spectral_denoising",
+    "merge_geometric_median",
+    "merge_stack_and_whiten",
 ]
 
 # Constants
@@ -1019,6 +1025,262 @@ def apply_consensus_mask(
 # ============================================================================
 
 @torch.no_grad()
+def random_merge_subspace(U: Tensor) -> Tensor:
+    """
+    Randomly select one task vector per parameter position.
+    
+    Args:
+        U: (K, m) or (K, d) tensor where K = num tasks
+        
+    Returns:
+        (m,) or (d,) tensor - randomly selected task vector per position
+    """
+    K = U.shape[0]
+    if K == 0:
+        return torch.zeros_like(U[0])
+    
+    # Generate random indices for each position
+    random_indices = torch.randint(0, K, (U.shape[1],), device=U.device)
+    
+    # Select random task vector for each position
+    result = U[random_indices, torch.arange(U.shape[1], device=U.device)]
+    
+    return result
+
+
+# ============================================================================
+# Advanced Aggregation Methods (TSV-Merge Inspired)
+# ============================================================================
+
+@torch.no_grad()
+def merge_consensus_whiten(U: Tensor, eps: float = 1e-6) -> Tensor:
+    """
+    Approach 1: Consensus-Whitened Residuals (CWR)
+    Fixes interference by orthogonalizing ONLY the disagreements (residuals),
+    preserving the shared knowledge (consensus).
+    
+    Best for: General purpose. Best balance of stability (keeps consensus) and interference reduction.
+    """
+    # Handle both 2D (K, M) and 3D (K, take, M) shapes
+    orig_shape = U.shape
+    if U.ndim == 3:
+        # Flatten batch dimension: (K, take, M) -> (K, take*M)
+        K, take, M = U.shape
+        U_flat = U.reshape(K, -1)
+    else:
+        U_flat = U
+        K = U_flat.shape[0]
+    
+    # 1. Compute Consensus (Mean)
+    consensus = U_flat.mean(dim=0)
+    
+    # 2. Compute Residuals
+    residuals = U_flat - consensus.unsqueeze(0)
+    
+    # 3. Whiten Residuals (Row/Task Covariance)
+    # Covariance is K x K (very small in SRP)
+    cov = (residuals @ residuals.mT) / (residuals.shape[1] - 1 + eps)
+    
+    # Eigen-decomposition (safer than Cholesky for ill-conditioned matrices)
+    vals, vecs = torch.linalg.eigh(cov)
+    
+    # Whitening Matrix: W = E * D^(-0.5) * E.T
+    inv_sqrt = (vals.clamp_min(eps)).rsqrt().unsqueeze(0)
+    W = (vecs * inv_sqrt) @ vecs.mT
+    
+    # 4. Rotate residuals to be orthogonal
+    whitened_residuals = W @ residuals
+    
+    # 5. Aggregate: Consensus + Mean of Orthogonalized Residuals
+    # Using mean() here maintains the scale of the original updates.
+    result = consensus + whitened_residuals.mean(dim=0)
+    
+    # Restore original shape if needed
+    if len(orig_shape) == 3:
+        result = result.view(orig_shape[1], orig_shape[2])
+    
+    return result
+
+
+@torch.no_grad()
+def merge_spectral_denoising(U: Tensor, energy_thresh: float = 0.95) -> Tensor:
+    """
+    Approach 2: Spectral Denoising Merge (SDM)
+    Uses SVD to identify and remove "noise" components (tail energy) 
+    introduced by random projections or weak task interference.
+    
+    Best for: High noise / many tasks. When merging 10+ tasks where random noise accumulation is a risk.
+    """
+    # Handle both 2D (K, M) and 3D (K, take, M) shapes
+    orig_shape = U.shape
+    if U.ndim == 3:
+        # Flatten batch dimension: (K, take, M) -> (K, take*M)
+        K, take, M = U.shape
+        U_flat = U.reshape(K, -1)
+    else:
+        U_flat = U
+    
+    # Transpose to (M, K) for standard SVD interpretation (Features x Samples)
+    Z = U_flat.mT  # Use .mT instead of .T to avoid deprecation warning
+    L, S, R = torch.linalg.svd(Z, full_matrices=False)
+    
+    # Compute cumulative energy of singular values (S is 1D)
+    energies = S.pow(2)
+    total_energy = energies.sum()
+    cum_energy = torch.cumsum(energies, dim=0) / total_energy
+    
+    # Hard Threshold: Keep components explaining X% variance
+    # Searchsorted finds the index where condition is first met
+    k = int(torch.searchsorted(cum_energy, energy_thresh).item()) + 1
+    k = min(k, len(S))
+    
+    # Reconstruct denoised signal
+    # Z_clean = L_k * S_k * R_k.T
+    Z_clean = (L[:, :k] * S[:k].unsqueeze(0)) @ R[:, :k].mT
+    
+    # Return mean of denoised tasks (average across columns)
+    result = Z_clean.mean(dim=1)
+    
+    # Restore original shape if needed
+    if len(orig_shape) == 3:
+        result = result.view(orig_shape[1], orig_shape[2])
+    
+    return result
+
+
+@torch.no_grad()
+def merge_geometric_median(U: Tensor, max_iter: int = 20, eps: float = 1e-6) -> Tensor:
+    """
+    Approach 3: Geometric Median (Weiszfeld's Algorithm)
+    Robust aggregation that ignores outliers (tasks that are far from the group).
+    
+    Best for: Outlier rejection. If one task model is "broken" or has exploded gradients.
+    """
+    # Handle both 2D (K, M) and 3D (K, take, M) shapes
+    orig_shape = U.shape
+    if U.ndim == 3:
+        # Flatten batch dimension: (K, take, M) -> (K, take*M)
+        K, take, M = U.shape
+        U_flat = U.reshape(K, -1)
+    else:
+        U_flat = U
+    
+    # Initial guess: Euclidean mean
+    gm = U_flat.mean(dim=0)
+    
+    for _ in range(max_iter):
+        # Distances from current median to all points: ||u_i - gm||
+        diff = U_flat - gm.unsqueeze(0)
+        norms = torch.norm(diff, dim=1)
+        
+        # Weiszfeld weights = 1 / distance
+        # Clamp distance to avoid division by zero
+        weights = 1.0 / torch.clamp(norms, min=eps)
+        weights = weights / weights.sum()
+        
+        # Weighted average update
+        new_gm = (weights.unsqueeze(1) * U_flat).sum(dim=0)
+        
+        # Check convergence
+        if torch.norm(new_gm - gm) < eps:
+            break
+        gm = new_gm
+    
+    # Restore original shape if needed
+    if len(orig_shape) == 3:
+        gm = gm.view(orig_shape[1], orig_shape[2])
+        
+    return gm
+
+
+@torch.no_grad()
+def merge_stack_and_whiten(
+    U: Tensor, 
+    mode: str = "procrustes", 
+    eps: float = 1e-6,
+    return_mean: bool = False,
+    newton_iter: int = 5
+) -> Tensor:
+    """
+    Approaches 4 & 5: Stack -> Whiten -> Aggregate
+    Implements the TSV-Merge paper logic.
+    
+    Modes:
+      - 'procrustes': SVD-based (Paper Exact). Best for: Maximum interference reduction.
+      - 'newton_schulz': SVD-Free Iterative. Best for: Speed / GPU efficiency.
+    
+    Args:
+        U: (K, M) or (K, take, M) task vectors in subspace
+        mode: 'procrustes' or 'newton_schulz'
+        eps: Small constant for numerical stability
+        return_mean: If True, return mean of whitened vectors; if False, return sum (paper default)
+        newton_iter: Number of Newton-Schulz iterations (only used if mode='newton_schulz')
+    
+    Returns:
+        Aggregated vector (M,) or (take, M)
+    """
+    # Handle both 2D (K, M) and 3D (K, take, M) shapes
+    orig_shape = U.shape
+    if U.ndim == 3:
+        # Flatten batch dimension: (K, take, M) -> (K, take*M)
+        K, take, M = U.shape
+        U_flat = U.reshape(K, -1)
+    else:
+        U_flat = U
+        K = U_flat.shape[0]
+    
+    if mode == "procrustes":
+        # Approach 4: Paper Exact via SVD
+        # U = L @ S @ R.T  -->  U_white = L @ R.T
+        L, S, R = torch.linalg.svd(U_flat, full_matrices=False)
+        U_white = L @ R 
+        
+    elif mode == "newton_schulz":
+        # Approach 5: SVD-Free Iterative Procrustes
+        # 1. Normalize by Frobenius norm to ensure singular values < sqrt(3)
+        # This guarantees convergence of the Newton iteration.
+        norm = U_flat.norm(p='fro') + eps
+        X = U_flat.div(norm)
+        
+        # Identity for iteration
+        I = torch.eye(K, device=U.device, dtype=U.dtype)
+        
+        # 2. Iteration: X_{k+1} = 0.5 * X_k * (3I - X_k^T * X_k) (for Col Ortho)
+        # We want Row Orthogonality (Tasks), so we adapt:
+        # X_{k+1} = 0.5 * (3I - X_k * X_k^T) * X_k
+        for _ in range(newton_iter):
+            A = X @ X.mT  # Covariance-like
+            X = 0.5 * (3 * I - A) @ X
+            
+        # X converges to the polar factor U_white (scaled by magnitude removed)
+        U_white = X
+
+    else:
+        # Fallback to ZCA if requested specifically
+        # (Standard ZCA: G^-0.5 @ U)
+        G = U_flat @ U_flat.mT
+        evals, evecs = torch.linalg.eigh(G)
+        inv_sqrt = (evals.clamp_min(eps)).rsqrt().unsqueeze(0)
+        W = (evecs * inv_sqrt) @ evecs.mT
+        U_white = W @ U_flat
+
+    # Aggregation Step
+    # The paper (Eq 5) uses SUM.
+    # However, MEAN is often safer for hyperparameter-free stability.
+    if return_mean:
+        result = U_white.mean(dim=0)
+    else:
+        # Paper default: Summing unit-strength orthogonal vectors
+        result = U_white.sum(dim=0)
+    
+    # Restore original shape if needed
+    if len(orig_shape) == 3:
+        result = result.view(orig_shape[1], orig_shape[2])
+    
+    return result
+
+
+@torch.no_grad()
 def zero_aware_aggregate(
     U: Tensor,
     merge_func: str,
@@ -1028,16 +1290,44 @@ def zero_aware_aggregate(
     K = U.shape[0]
     mf = merge_func.lower()
     valid_funcs = {
-        "sum", "mean", "max", "signmax", "ema",
+        "sum", "mean", "max", "signmax", "ema", "random",
         "ties_sum", "ties_mean", "ties_max",
         "energy_equalize", "variance_aware", "subspace_whiten",
         "conflict_gating", "elect_then_avg", "soft_signmax", "signmax_mad_normalized",
         "align_weighted_mean", "coherence_penalized", "orthogonal_deflation",
-        "odm_ema_tuning_free"
+        "odm_ema_tuning_free",
+        "consensus_whiten", "spectral_denoise", "geometric_median",
+        "stack_whiten_procrustes", "stack_whiten_newton"
     }
     if mf not in valid_funcs:
         raise ValueError(f"merge_func={merge_func} not in {valid_funcs}")
 
+    # --- New Advanced Methods (TSV-Merge Inspired) ---
+    
+    if mf == "consensus_whiten":
+        return merge_consensus_whiten(U, eps=kwargs.get("eps", 1e-6))
+    
+    if mf == "spectral_denoise":
+        return merge_spectral_denoising(U, energy_thresh=kwargs.get("sdm_energy", 0.95))
+    
+    if mf == "geometric_median":
+        return merge_geometric_median(U, max_iter=kwargs.get("gm_iter", 20), eps=kwargs.get("eps", 1e-6))
+    
+    if mf == "stack_whiten_procrustes":
+        # Defaults to SUM (return_mean=False) to match paper Eq. 5
+        return merge_stack_and_whiten(U, mode="procrustes", return_mean=False, eps=kwargs.get("eps", 1e-6))
+    
+    if mf == "stack_whiten_newton":
+        return merge_stack_and_whiten(
+            U, 
+            mode="newton_schulz", 
+            return_mean=False, 
+            newton_iter=kwargs.get("newton_iter", 5),
+            eps=kwargs.get("eps", 1e-6)
+        )
+
+    # --- Existing Advanced Methods ---
+    
     if mf == "ema":
         return ema_merge_subspace(
             U,
@@ -1081,6 +1371,14 @@ def zero_aware_aggregate(
         all_zero = (absU.sum(dim=0) == 0)
         if all_zero.any():
             out = out.masked_fill(all_zero, 0.0)
+        
+        # Log decisions if callback provided
+        decision_callback = kwargs.get("decision_callback", None)
+        if decision_callback is not None:
+            # Count wins for each task (aggregate across all parameters in this tensor)
+            winner_counts = torch.bincount(idx.flatten().cpu(), minlength=U.shape[0])
+            decision_callback(winner_counts.tolist())
+        
         return out
 
     if mf == "signmax":
@@ -1102,7 +1400,19 @@ def zero_aware_aggregate(
         all_zero = (absU.sum(dim=0) == 0)
         if all_zero.any():
             out = out.masked_fill(all_zero, 0.0)
+        
+        # Log decisions if callback provided
+        decision_callback = kwargs.get("decision_callback", None)
+        if decision_callback is not None:
+            # Count wins for each task (aggregate across all parameters in this tensor)
+            winner_counts = torch.bincount(idx.flatten().cpu(), minlength=U.shape[0])
+            decision_callback(winner_counts.tolist())
+        
         return out
+
+    if mf == "random":
+        # Randomly select one task vector per parameter position
+        return random_merge_subspace(U)
 
     # Advanced functions need flattening
     orig_shape = U.shape[1:]

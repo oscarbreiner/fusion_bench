@@ -16,7 +16,6 @@ from fusion_bench.utils.state_dict_arithmetic import state_dict_add, state_dict_
 
 # Import utilities from srp_utils
 from .srp_utils import (
-    EPS,
     create_projection_ops,
     create_multi_sketch_ops,
     zero_aware_aggregate,
@@ -27,6 +26,9 @@ from .srp_utils import (
     generate_tall_masks,
     apply_consensus_mask,
 )
+
+# Local constant
+EPS = 1e-12
 
 # Import projection size estimator for adaptive sizing
 from .projection_size_estimator import (
@@ -56,7 +58,8 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                       - "layer": layer-wise projection
                       - "global": global projection across all parameters
       merge_where:    "subspace" | "postlift"
-      merge_func:     "sum" | "mean" | "max" | "signmax" | "ema" | "ties_sum" | "ties_mean" | "ties_max"
+      merge_func:     "sum" | "mean" | "max" | "signmax" | "ema" | "ties_sum" | "ties_mean" | "ties_max" | "random"
+                      - "random": randomly select one task vector per parameter
       proj_ratio:     float (0..1) - used for fixed sizing or as ratio parameter in adaptive config
       use_G:          bool (kept for analyzer compatibility; not used by projections)
       block_rows:     int
@@ -84,6 +87,12 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
       
       # TSV-style linear/non-linear separation:
       only_project_linear: bool
+      nonlinear_merge_mode: "mean" | "drop" | "sum" | "max" | "signmax"
+      nonlinear_scale: float
+      separate_norm_layers: bool
+      norm_merge_mode: "mean" | "drop" | "sum" | "max" | "signmax"
+      project_embeddings: bool
+      drop_mlp_update: bool  # If true, exclude MLP layers from merging (pretrained MLP only)
       
       # Adaptive projection sizing:
       use_adaptive_proj_size: bool
@@ -145,8 +154,14 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         analysis_output_path: str = None,
         # TSV-style linear/non-linear separation
         only_project_linear: bool = False,
+        nonlinear_merge_mode: str = "mean",  # mean | drop | sum | max | signmax
+        nonlinear_scale: float = 1.0,
+        separate_norm_layers: bool = False,
+        norm_merge_mode: str = "mean",  # mean | drop | sum | max | signmax (for norm layers when separate_norm_layers=true)
         # Embedding layer projection control
         project_embeddings: bool = True,
+        # MLP layer exclusion
+        drop_mlp_update: bool = False,  # If true, exclude MLP layers from merging
         # Adaptive projection size estimation
         use_adaptive_proj_size: bool = False,
         adaptive_proj_mode: str = "tensor",
@@ -181,12 +196,19 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         use_consensus_mask: bool = False,
         tall_mask_lambda: float = 0.6,
         consensus_threshold: int = 2,
+        # Iso-Merging Parameters
+        use_iso_preprocessing: bool = False,
+        use_iso_postprocessing: bool = False,
+        # Decision logging parameters
+        log_max_decision: bool = False,
         # Kept in signature for compatibility (not used)
         ties_trim_pct: float = 0.0,
         tadrop_tau: float = 0.0,
         use_pareto: bool = False,
         **kwargs: Any,
     ):
+        self.log_max_decision = log_max_decision
+        self.decision_stats = None  # Will store task win statistics if logging enabled
         super().__init__(**kwargs)
         self.proj_ratio = float(proj_ratio)
         self.use_G = bool(use_G)  # kept for analyzer interface; projection ops ignore it
@@ -230,9 +252,26 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
         # TSV-style linear/non-linear separation
         self.only_project_linear = bool(only_project_linear)
+        self.nonlinear_merge_mode = str(nonlinear_merge_mode).lower()
+        if self.nonlinear_merge_mode not in {"mean", "drop", "sum", "max", "signmax"}:
+            raise ValueError(
+                f"nonlinear_merge_mode must be one of ['mean', 'drop', 'sum', 'max', 'signmax'], "
+                f"got '{nonlinear_merge_mode}'"
+            )
+        self.nonlinear_scale = float(nonlinear_scale)
+        self.separate_norm_layers = bool(separate_norm_layers)
+        self.norm_merge_mode = str(norm_merge_mode).lower()
+        if self.norm_merge_mode not in {"mean", "drop", "sum", "max", "signmax"}:
+            raise ValueError(
+                f"norm_merge_mode must be one of ['mean', 'drop', 'sum', 'max', 'signmax'], "
+                f"got '{norm_merge_mode}'"
+            )
 
         # Embedding layer projection control
         self.project_embeddings = bool(project_embeddings)
+
+        # MLP layer exclusion
+        self.drop_mlp_update = bool(drop_mlp_update)
 
         # Multi-Sketch parameters
         self.num_sketches = int(num_sketches)
@@ -255,6 +294,10 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             f"tall_mask_lambda must be in [0, 1], got {self.tall_mask_lambda}"
         assert self.consensus_threshold >= 0, \
             f"consensus_threshold must be >= 0, got {self.consensus_threshold}"
+
+        # Iso-Merging parameters
+        self.use_iso_preprocessing = bool(use_iso_preprocessing)
+        self.use_iso_postprocessing = bool(use_iso_postprocessing)
 
         # Adaptive projection size estimation
         self.use_adaptive_proj_size = bool(use_adaptive_proj_size)
@@ -288,6 +331,97 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         self.run_analysis = run_analysis
         self.analysis_methods = analysis_methods or []
         self.analysis_output_path = analysis_output_path
+
+    def _apply_iso_scaling(self, tensor: torch.Tensor, key: str = "") -> torch.Tensor:
+        """
+        Apply Isotropic Merging (Iso-C) scaling to a tensor.
+        Makes the spectrum of singular values uniform.
+        """
+        if tensor.ndim != 2:
+            return tensor
+            
+        # Exclude text_projection as in original implementation
+        if "text_projection" in key:
+            return tensor
+
+        try:
+            U, S, V = torch.linalg.svd(tensor, full_matrices=False)
+            S_mean = torch.ones_like(S) * S.mean()
+            return torch.linalg.multi_dot((U, torch.diag(S_mean), V))
+        except Exception as e:
+            print(f"[Iso-Merging] SVD failed for {key}: {e}")
+            return tensor
+
+    # ---------- Decision tracking methods ----------
+    def _init_decision_tracking(self, task_names: List[str]) -> Dict[str, Any]:
+        """Initialize decision tracking structure."""
+        return {
+            "task_names": task_names,
+            "total_decisions": 0,
+            "layer_stats": {},  # layer_name -> {task_idx -> count}
+            "global_wins": {i: 0 for i in range(len(task_names))},
+        }
+    
+    def _log_decision(self, layer_name: str, winner_idx: int):
+        """Log a single decision for a layer."""
+        if self.decision_stats is None:
+            return
+        
+        if layer_name not in self.decision_stats["layer_stats"]:
+            self.decision_stats["layer_stats"][layer_name] = {
+                i: 0 for i in range(len(self.decision_stats["task_names"]))
+            }
+        
+        self.decision_stats["layer_stats"][layer_name][winner_idx] += 1
+        self.decision_stats["global_wins"][winner_idx] += 1
+        self.decision_stats["total_decisions"] += 1
+    
+    def _finalize_decision_stats(self) -> Dict[str, Any]:
+        """Compute final statistics with percentages."""
+        if self.decision_stats is None:
+            return {}
+        
+        stats = self.decision_stats.copy()
+        total = stats["total_decisions"]
+        
+        if total > 0:
+            # Add global percentages
+            stats["global_win_percentages"] = {
+                task_name: (stats["global_wins"][i] / total) * 100
+                for i, task_name in enumerate(stats["task_names"])
+            }
+            
+            # Add layer percentages
+            stats["layer_percentages"] = {}
+            for layer_name, layer_wins in stats["layer_stats"].items():
+                layer_total = sum(layer_wins.values())
+                if layer_total > 0:
+                    stats["layer_percentages"][layer_name] = {
+                        stats["task_names"][i]: (count / layer_total) * 100
+                        for i, count in layer_wins.items()
+                    }
+        
+        return stats
+    
+    def _create_decision_callback(self, layer_name: str):
+        """Create a callback function for logging decisions in a specific layer."""
+        if self.decision_stats is None:
+            return None
+        
+        def callback(winner_counts: List[int]):
+            # winner_counts is a list where winner_counts[i] = number of wins for task i
+            for task_idx, count in enumerate(winner_counts):
+                if count > 0:
+                    # Log each decision (we track per-parameter decisions)
+                    if layer_name not in self.decision_stats["layer_stats"]:
+                        self.decision_stats["layer_stats"][layer_name] = {
+                            i: 0 for i in range(len(self.decision_stats["task_names"]))
+                        }
+                    self.decision_stats["layer_stats"][layer_name][task_idx] += count
+                    self.decision_stats["global_wins"][task_idx] += count
+                    self.decision_stats["total_decisions"] += count
+        
+        return callback
 
     # ---------- small helper ----------
     @staticmethod
@@ -327,6 +461,37 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         ]
         name_lower = name.lower()
         return any(pattern in name_lower for pattern in linear_patterns) and ".weight" in name
+
+    @staticmethod
+    def _is_mlp_layer(name: str) -> bool:
+        """
+        Check if a parameter belongs to an MLP/FFN layer.
+        Used for drop_mlp_update functionality.
+        """
+        mlp_patterns = [
+            "mlp", "fc", "ffn", "feed_forward", "feedforward",
+            "fc1", "fc2", "c_fc", "c_proj",  # GPT-2 style
+        ]
+        name_lower = name.lower()
+        return any(pattern in name_lower for pattern in mlp_patterns)
+
+    @staticmethod
+    def _is_norm_layer(name: str) -> bool:
+        """
+        Check if a parameter belongs to a normalization layer.
+        Includes: BatchNorm, LayerNorm, GroupNorm, InstanceNorm, RMSNorm, etc.
+        """
+        norm_patterns = [
+            "bn", "batch_norm", "batchnorm",
+            "ln", "layer_norm", "layernorm",
+            "gn", "group_norm", "groupnorm",
+            "in", "instance_norm", "instancenorm",
+            "rms_norm", "rmsnorm",
+            ".norm", ".norm1", ".norm2", ".norm3",
+            "_norm", "_norm1", "_norm2", "_norm3",
+        ]
+        name_lower = name.lower()
+        return any(pattern in name_lower for pattern in norm_patterns)
 
     @staticmethod
     def _is_embedding_layer(name: str) -> bool:
@@ -980,6 +1145,56 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             raise ValueError(f"Unknown sketch_ensemble_mode: {self.sketch_ensemble_mode}")
 
     # ------------------- main -------------------
+    def _init_decision_tracking(self, task_names: List[str]) -> Dict[str, Any]:
+        """Initialize decision tracking structure."""
+        return {
+            "task_names": task_names,
+            "total_decisions": 0,
+            "layer_stats": {},  # layer_name -> {task_idx -> count}
+            "global_wins": {i: 0 for i in range(len(task_names))},
+        }
+    
+    def _log_decision(self, layer_name: str, winner_idx: int):
+        """Log a single decision for a layer."""
+        if self.decision_stats is None:
+            return
+        
+        if layer_name not in self.decision_stats["layer_stats"]:
+            self.decision_stats["layer_stats"][layer_name] = {
+                i: 0 for i in range(len(self.decision_stats["task_names"]))
+            }
+        
+        self.decision_stats["layer_stats"][layer_name][winner_idx] += 1
+        self.decision_stats["global_wins"][winner_idx] += 1
+        self.decision_stats["total_decisions"] += 1
+    
+    def _finalize_decision_stats(self) -> Dict[str, Any]:
+        """Compute final statistics with percentages."""
+        if self.decision_stats is None:
+            return {}
+        
+        stats = self.decision_stats.copy()
+        total = stats["total_decisions"]
+        
+        if total > 0:
+            # Add global percentages
+            stats["global_win_percentages"] = {
+                task_name: (stats["global_wins"][i] / total) * 100
+                for i, task_name in enumerate(stats["task_names"])
+            }
+            
+            # Add layer percentages
+            stats["layer_percentages"] = {}
+            for layer_name, layer_wins in stats["layer_stats"].items():
+                layer_total = sum(layer_wins.values())
+                if layer_total > 0:
+                    stats["layer_percentages"][layer_name] = {
+                        stats["task_names"][i]: (count / layer_total) * 100
+                        for i, count in layer_wins.items()
+                    }
+        
+        return stats
+    
     @torch.no_grad()
     def run(
         self, modelpool: BaseModelPool | Dict[str, nn.Module], **kwargs: Any
@@ -997,6 +1212,12 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 modelpool.load_model(n).state_dict(keep_vars=True) for n in donor_names
             ]
             base_sd: Dict[str, Tensor] = base_model.state_dict(keep_vars=True)
+            
+            # Initialize decision tracking if enabled
+            if self.log_max_decision and self.merge_func in {"max", "signmax"}:
+                self.decision_stats = self._init_decision_tracking(donor_names)
+                print(f"\n[Decision Tracking] Enabled for merge_func='{self.merge_func}'")
+                print(f"[Decision Tracking] Tracking wins for {len(donor_names)} tasks: {donor_names}")
 
         # ---------- Weight Matching Preprocessing (Optional) ----------
         if self.use_weight_matching:
@@ -1123,7 +1344,7 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         if rows <= 0:
                             continue
 
-                        original_tv = tb.view(rows, d_last).float()
+                        original_tv = tb.reshape(rows, d_last).float()
 
                         # Determine dimension based on scope
                         seed_key = proj_seed_key_ta(name)
@@ -1202,7 +1423,7 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                             relative_error = tensor_error / tensor_norm
                             reconstruction_errors.append((name, relative_error))
 
-                        tv_cpu[name] = reconstructed_tv.view(tb.shape).to(tb.dtype)
+                        tv_cpu[name] = reconstructed_tv.reshape(tb.shape).to(tb.dtype)
 
                     if total_norm > 0:
                         global_relative_error = total_reconstruction_error / total_norm
@@ -1261,13 +1482,30 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
         if self.only_project_linear:
             keys_linear = [k for k in keys_float if base_sd[k].ndim == 2]
-            keys_nonlinear = [k for k in keys_float if base_sd[k].ndim != 2]
-            print(
-                f"[only_project_linear] linear (2D) tensors={len(keys_linear)} | non-linear tensors={len(keys_nonlinear)}"
-            )
+            keys_nonlinear_all = [k for k in keys_float if base_sd[k].ndim != 2]
+            
+            # Optionally separate normalization layers from other non-linear weights
+            if self.separate_norm_layers and keys_nonlinear_all:
+                keys_norm = [k for k in keys_nonlinear_all if self._is_norm_layer(k)]
+                keys_nonlinear = [k for k in keys_nonlinear_all if not self._is_norm_layer(k)]
+            else:
+                keys_norm = []
+                keys_nonlinear = keys_nonlinear_all
+            
+            if self.separate_norm_layers:
+                print(
+                    f"[only_project_linear] linear (2D) tensors={len(keys_linear)} | "
+                    f"non-linear tensors={len(keys_nonlinear)} | norm layers={len(keys_norm)}"
+                )
+            else:
+                print(
+                    f"[only_project_linear] linear (2D) tensors={len(keys_linear)} | "
+                    f"non-linear tensors={len(keys_nonlinear)}"
+                )
         else:
             keys_linear = keys_float
             keys_nonlinear = []
+            keys_norm = []
         
         # Filter out embedding layers if project_embeddings=False
         if not self.project_embeddings:
@@ -1277,6 +1515,15 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             if keys_embedding:
                 print(f"[project_embeddings=False] Excluding {len(keys_embedding)} embedding layers from projection")
                 print(f"[project_embeddings=False] Embedding layers (merged in original space): {keys_embedding[:3]}{'...' if len(keys_embedding) > 3 else ''}")
+
+        # Filter out MLP layers if drop_mlp_update=True
+        if self.drop_mlp_update:
+            keys_mlp = [k for k in keys_linear if self._is_mlp_layer(k)]
+            keys_linear = [k for k in keys_linear if not self._is_mlp_layer(k)]
+            if keys_mlp:
+                print(f"[drop_mlp_update=True] Excluding {len(keys_mlp)} MLP layers from merging")
+                print(f"[drop_mlp_update=True] MLP layers (pretrained weights only): {keys_mlp[:5]}{'...' if len(keys_mlp) > 5 else ''}")
+            # Note: MLP layers are NOT added to nonlinear - they are simply dropped from merging entirely
 
         K = len(donor_names)
         print(
@@ -1494,19 +1741,117 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         merged_delta = {}
 
         with self.profile("merging models"):
-            # ---------- Process non-linear weights (1D) with mean in original space ----------
+            # ---------- Process non-linear weights (1D) in original space ----------
             if self.only_project_linear and keys_nonlinear:
                 print(
-                    f"[Merging non-linear weights] Processing {len(keys_nonlinear)} non-linear tensors with mean in original space"
+                    f"[Merging non-linear weights] Processing {len(keys_nonlinear)} non-linear tensors "
+                    f"with mode='{self.nonlinear_merge_mode}' (scale={self.nonlinear_scale})"
                 )
                 for name in keys_nonlinear:
                     base_val = base_cpu[name].float()
-                    result = base_val.clone()
-                    for i, dsd in enumerate(donors_cpu):
-                        donor_val = dsd[name].float()
-                        result += (donor_val - result) / (i + 2)
-                    # Store delta instead of modifying base_cpu
-                    delta = (result - base_val) * self.scale
+                    
+                    # Compute task vectors for all donors
+                    task_vecs = torch.stack([
+                        (dsd[name].float() - base_val) for dsd in donors_cpu
+                    ], dim=0)  # Shape: (K, *tensor_shape)
+                    
+                    # Merge task vectors according to mode
+                    if self.nonlinear_merge_mode == "mean":
+                        # Original behavior: mean of task vectors
+                        merged_tv = task_vecs.mean(dim=0)
+                    
+                    elif self.nonlinear_merge_mode == "drop":
+                        # Drop to zero: no update
+                        merged_tv = torch.zeros_like(base_val)
+                    
+                    elif self.nonlinear_merge_mode == "sum":
+                        # Sum of task vectors with optional scaling
+                        merged_tv = task_vecs.sum(dim=0) * self.nonlinear_scale
+                    
+                    elif self.nonlinear_merge_mode == "max":
+                        # Max magnitude task vector
+                        abs_tvs = task_vecs.abs()
+                        max_idx = abs_tvs.argmax(dim=0)  # Shape: tensor_shape
+                        merged_tv = torch.gather(task_vecs, 0, max_idx.unsqueeze(0)).squeeze(0)
+                    
+                    elif self.nonlinear_merge_mode == "signmax":
+                        # Majority sign, then max magnitude with that sign
+                        signs = torch.sign(task_vecs)
+                        # Resolve zero signs to +1
+                        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+                        majority_sign = signs.sum(dim=0).sign()  # Shape: tensor_shape
+                        majority_sign = torch.where(majority_sign == 0, torch.ones_like(majority_sign), majority_sign)
+                        
+                        # For each position, gather task vectors with majority sign
+                        agree_mask = (signs == majority_sign.unsqueeze(0))  # Shape: (K, *tensor_shape)
+                        masked_tvs = torch.where(agree_mask, task_vecs, torch.zeros_like(task_vecs))
+                        abs_masked = masked_tvs.abs()
+                        max_idx = abs_masked.argmax(dim=0)  # Shape: tensor_shape
+                        merged_tv = torch.gather(masked_tvs, 0, max_idx.unsqueeze(0)).squeeze(0)
+                    
+                    else:
+                        raise ValueError(f"Unknown nonlinear_merge_mode: {self.nonlinear_merge_mode}")
+                    
+                    # Store delta
+                    delta = merged_tv * self.scale
+                    merged_delta[name] = delta
+                    merged_tensors += 1
+                    if delta.abs().max().item() > 0:
+                        changed_params += 1
+            
+            # ---------- Process normalization layers (if separated) ----------
+            if self.only_project_linear and self.separate_norm_layers and keys_norm:
+                print(
+                    f"[Merging norm layers] Processing {len(keys_norm)} normalization layers "
+                    f"with mode='{self.norm_merge_mode}' (scale={self.nonlinear_scale})"
+                )
+                for name in keys_norm:
+                    base_val = base_cpu[name].float()
+                    
+                    # Compute task vectors for all donors
+                    task_vecs = torch.stack([
+                        (dsd[name].float() - base_val) for dsd in donors_cpu
+                    ], dim=0)  # Shape: (K, *tensor_shape)
+                    
+                    # Merge task vectors according to norm_merge_mode
+                    if self.norm_merge_mode == "mean":
+                        # Mean of task vectors (default, recommended for stability)
+                        merged_tv = task_vecs.mean(dim=0)
+                    
+                    elif self.norm_merge_mode == "drop":
+                        # Drop to zero: no update
+                        merged_tv = torch.zeros_like(base_val)
+                    
+                    elif self.norm_merge_mode == "sum":
+                        # Sum of task vectors with optional scaling
+                        merged_tv = task_vecs.sum(dim=0) * self.nonlinear_scale
+                    
+                    elif self.norm_merge_mode == "max":
+                        # Max magnitude task vector
+                        abs_tvs = task_vecs.abs()
+                        max_idx = abs_tvs.argmax(dim=0)  # Shape: tensor_shape
+                        merged_tv = torch.gather(task_vecs, 0, max_idx.unsqueeze(0)).squeeze(0)
+                    
+                    elif self.norm_merge_mode == "signmax":
+                        # Majority sign, then max magnitude with that sign
+                        signs = torch.sign(task_vecs)
+                        # Resolve zero signs to +1
+                        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+                        majority_sign = signs.sum(dim=0).sign()  # Shape: tensor_shape
+                        majority_sign = torch.where(majority_sign == 0, torch.ones_like(majority_sign), majority_sign)
+                        
+                        # For each position, gather task vectors with majority sign
+                        agree_mask = (signs == majority_sign.unsqueeze(0))  # Shape: (K, *tensor_shape)
+                        masked_tvs = torch.where(agree_mask, task_vecs, torch.zeros_like(task_vecs))
+                        abs_masked = masked_tvs.abs()
+                        max_idx = abs_masked.argmax(dim=0)  # Shape: tensor_shape
+                        merged_tv = torch.gather(masked_tvs, 0, max_idx.unsqueeze(0)).squeeze(0)
+                    
+                    else:
+                        raise ValueError(f"Unknown norm_merge_mode: {self.norm_merge_mode}")
+                    
+                    # Store delta
+                    delta = merged_tv * self.scale
                     merged_delta[name] = delta
                     merged_tensors += 1
                     if delta.abs().max().item() > 0:
@@ -1523,7 +1868,7 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                 # Special case: per_flat_tensor
                 if self.subspace_scope == "per_flat_tensor":
                     flat_dim = tb.numel()
-                    vb_flat = tb.view(-1).float()
+                    vb_flat = tb.reshape(-1).float()
 
                     layer_idx = param_to_layer_idx.get(name, 0)
                     all_dims = getattr(self, '_all_dims', None)
@@ -1564,8 +1909,14 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     # Collect all donor deltas
                     Xs: List[Tensor] = []
                     for dsd in donors_cpu:
-                        donor_flat = dsd[name].view(-1).float()
-                        delta = donor_flat - vb_flat
+                        if self.use_iso_preprocessing:
+                            donor_val = dsd[name].float()
+                            delta_2d = donor_val - base_cpu[name].float()
+                            delta_2d = self._apply_iso_scaling(delta_2d, key=name)
+                            delta = delta_2d.reshape(-1)
+                        else:
+                            donor_flat = dsd[name].reshape(-1).float()
+                            delta = donor_flat - vb_flat
                         Xs.append(delta)
 
                     # 🚀 OPTIMIZATION: Batch all donors into single GPU call
@@ -1578,8 +1929,8 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                         # Lift each sketch, then merge in original space, then ensemble
                         Xhats_sketches = []
                         for Y_j, lift_j in zip(Y_sketches, lift_ops):
-                            Y_j_flat = Y_j.view(-1, Y_j.shape[-1])
-                            Xhats_j = lift_j(Y_j_flat).view(len(Xs), -1)  # [K, flat_dim]
+                            Y_j_flat = Y_j.reshape(-1, Y_j.shape[-1])
+                            Xhats_j = lift_j(Y_j_flat).reshape(len(Xs), -1)  # [K, flat_dim]
                             Xhats_sketches.append(Xhats_j)
                         
                         # Merge each sketch separately in original space
@@ -1597,6 +1948,7 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                                 ema_w_c=self.ema_w_c,
                                 ema_w_s=self.ema_w_s,
                                 ema_custom_order=ema_custom_indices,
+                                decision_callback=self._create_decision_callback(name),
                             )
                             Xmerge_sketches.append(Xmerge_j)
                         
@@ -1630,6 +1982,7 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                                 ema_gamma=self.ema_gamma,
                                 ema_w_c=self.ema_w_c,
                                 ema_w_s=self.ema_w_s,
+                                decision_callback=self._create_decision_callback(name),
                                 ema_custom_order=ema_custom_indices,
                             )
                             Ymerge_sketches.append(Ymerge_j)
@@ -1639,7 +1992,7 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
 
                         if lift_err_den < 1e8:
                             # Use first sketch for error estimation
-                            X0_rec = lift_ops[0](Y_sketches[0][0:1]).view(-1)
+                            X0_rec = lift_ops[0](Y_sketches[0][0:1]).reshape(-1)
                             diff = (X0_rec.to(torch.float32) - X_batch[0].to(torch.float32))
                             lift_err_num += float(diff.pow(2).sum().item())
                             lift_err_den += float(X_batch[0].pow(2).sum().item())
@@ -1663,7 +2016,7 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     continue  # done with per_flat_tensor
 
                 # Standard row-wise processing
-                vb = tb.view(rows, d_last).float()
+                vb = tb.reshape(rows, d_last).float()
                 br = min(self.block_rows, rows)
 
                 layer_idx = param_to_layer_idx.get(name, 0)
@@ -1717,6 +2070,15 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                                                   dtype=torch.float32, device=dev)
                 # Note: For multi-sketch, we'll allocate Y buffers per-sketch on-demand
 
+                # Pre-compute iso-scaled deltas if needed
+                iso_deltas = None
+                if self.use_iso_preprocessing:
+                    iso_deltas = []
+                    for dsd in donors_cpu:
+                        delta = dsd[name].float() - base_cpu[name].float()
+                        delta = self._apply_iso_scaling(delta, key=name)
+                        iso_deltas.append(delta)
+
                 # Allocate delta accumulator for this tensor
                 delta_accumulator = torch.zeros_like(vb)
                 
@@ -1732,8 +2094,12 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     
                     # Collect all donor deltas directly into buffer
                     for i, dsd in enumerate(donors_cpu):
-                        sl_donor = dsd[name].view(rows, d_last).float()[cursor : cursor + take, :]
-                        delta = sl_donor - sl_base
+                        if iso_deltas is not None:
+                            delta = iso_deltas[i][cursor : cursor + take, :]
+                        else:
+                            sl_donor = dsd[name].reshape(rows, d_last).float()[cursor : cursor + take, :]
+                            delta = sl_donor - sl_base
+
                         if global_D is not None and d_last < cur_D:
                             X_batch_view[i, :, :d_last].copy_(delta)
                             X_batch_view[i, :, d_last:].zero_()
@@ -1744,22 +2110,22 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                     X_batch_gpu_view = X_batch_gpu_buffer[:, :take, :]
                     X_batch_gpu_view.copy_(X_batch_view, non_blocking=True)
                     
-                    X_batch_flat = X_batch_gpu_view.view(-1, X_batch_gpu_view.shape[-1])  # [K*take, d]
+                    X_batch_flat = X_batch_gpu_view.reshape(-1, X_batch_gpu_view.shape[-1])  # [K*take, d]
                     
                     # Multi-sketch: project with each sketch operator
                     Y_sketches = []
                     for fwd_j in fwd_ops:
                         Y_j_flat = fwd_j(X_batch_flat)  # [K*take, m]
-                        Y_j = Y_j_flat.view(len(donors_cpu), take, -1)  # [K, take, m]
+                        Y_j = Y_j_flat.reshape(len(donors_cpu), take, -1)  # [K, take, m]
                         Y_sketches.append(Y_j)
 
                     if self.merge_where == "postlift":
                         # Lift each sketch, merge in original space, then ensemble
                         Xmerge_sketches = []
                         for Y_j, lift_j in zip(Y_sketches, lift_ops):
-                            Y_j_flat = Y_j.view(-1, Y_j.shape[-1])
+                            Y_j_flat = Y_j.reshape(-1, Y_j.shape[-1])
                             Xhats_j_flat = lift_j(Y_j_flat)  # [K*take, cur_D]
-                            Xhats_j = Xhats_j_flat.view(len(donors_cpu), take, -1)  # [K, take, cur_D]
+                            Xhats_j = Xhats_j_flat.reshape(len(donors_cpu), take, -1)  # [K, take, cur_D]
                             Xhats_j = Xhats_j[:, :, :d_last] if cur_D > d_last else Xhats_j
                             
                             Xmerge_j = _zero_aware_aggregate(
@@ -1774,6 +2140,7 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                                 ema_w_c=self.ema_w_c,
                                 ema_w_s=self.ema_w_s,
                                 ema_custom_order=ema_custom_indices,
+                                decision_callback=self._create_decision_callback(name),
                             )
                             Xmerge_sketches.append(Xmerge_j)
                         
@@ -1808,6 +2175,7 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
                                 ema_w_c=self.ema_w_c,
                                 ema_w_s=self.ema_w_s,
                                 ema_custom_order=ema_custom_indices,
+                                decision_callback=self._create_decision_callback(name),
                             )
                             Ymerge_sketches.append(Ymerge_j)
                         
@@ -1980,6 +2348,39 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
         # We just need to apply post-processing if enabled
         print(f"\n[Merged Delta] Task vector ready with {len(merged_delta)} parameters")
         
+        # Step 1.5: Apply Iso-Merging Post-processing (if enabled)
+        if self.use_iso_postprocessing:
+            print("\n=== Applying Iso-Merging Post-processing ===")
+            with self.profile("iso_postprocessing"):
+                iso_count = 0
+                skipped_count = 0
+                
+                for k in keys_float:
+                    if k not in merged_delta:
+                        continue
+                    
+                    # Only apply to 2D tensors (weight matrices)
+                    if merged_delta[k].ndim != 2:
+                        skipped_count += 1
+                        continue
+                        
+                    # Apply Iso-C scaling
+                    merged_delta[k] = self._apply_iso_scaling(merged_delta[k], key=k)
+                    iso_count += 1
+                
+                print(f"[Iso-Merging] Applied Iso-C scaling to {iso_count} parameters")
+                print(f"[Iso-Merging] Skipped {skipped_count} non-2D parameters")
+                
+                if not hasattr(self, '_runtime_info'):
+                    self._runtime_info = {}
+                self._runtime_info['iso_postprocessing_enabled'] = True
+                self._runtime_info['iso_postprocessing_count'] = int(iso_count)
+                print("=" * 50)
+        else:
+             if not hasattr(self, '_runtime_info'):
+                self._runtime_info = {}
+             self._runtime_info['iso_postprocessing_enabled'] = False
+
         # Step 2: Apply Subspace Boosting (if enabled)
         if self.use_subspace_boosting:
             print("\n=== Applying Subspace Boosting ===")
@@ -2194,6 +2595,47 @@ class SRPSubspaceMergeAlgorithm(SimpleProfilerMixin, BaseAlgorithm):
             raise RuntimeError("No tensors were processed; check eligibility filters.")
         if changed_params == 0:
             print("⚠️ Note: processed tensors but no numeric changes detected (donor deltas may be zero).")
+
+        # ---------- Save decision statistics if enabled ----------
+        if self.log_max_decision and self.decision_stats is not None:
+            print("\n=== Decision Tracking Statistics ===")
+            final_stats = self._finalize_decision_stats()
+            
+            # Print summary
+            print(f"[Decision Tracking] Total decisions: {final_stats['total_decisions']:,}")
+            print(f"[Decision Tracking] Tasks tracked: {len(final_stats['task_names'])}")
+            print("\n[Decision Tracking] Global Win Statistics:")
+            for task_name, percentage in final_stats.get('global_win_percentages', {}).items():
+                count = final_stats['global_wins'][final_stats['task_names'].index(task_name)]
+                print(f"  - {task_name}: {count:,} wins ({percentage:.2f}%)")
+            
+            # Save to file
+            output_dir = self._get_output_directory()
+            decision_stats_file = output_dir / "decision_statistics.json"
+            
+            import json
+            with open(decision_stats_file, 'w') as f:
+                # Convert layer stats keys from int to task names for readability
+                readable_stats = final_stats.copy()
+                readable_stats['layer_stats_by_name'] = {}
+                for layer_name, layer_wins in final_stats['layer_stats'].items():
+                    readable_stats['layer_stats_by_name'][layer_name] = {
+                        final_stats['task_names'][i]: count 
+                        for i, count in layer_wins.items()
+                    }
+                json.dump(readable_stats, f, indent=2)
+            
+            print(f"\n[Decision Tracking] Statistics saved to: {decision_stats_file}")
+            print("=" * 50)
+            
+            # Store in runtime info for inclusion in other output files
+            if not hasattr(self, '_runtime_info'):
+                self._runtime_info = {}
+            self._runtime_info['decision_tracking'] = {
+                'enabled': True,
+                'total_decisions': final_stats['total_decisions'],
+                'global_win_percentages': final_stats.get('global_win_percentages', {}),
+            }
 
         if self.run_analysis and self.analysis_methods:
             print("\n=== Running Integrated Analysis ===")

@@ -99,7 +99,18 @@ merge_where: "subspace"       # subspace | postlift
 # ============================================================================
 # Merging Strategy
 # ============================================================================
-merge_func: "signmax"         # sum | mean | max | signmax | ema | ties_sum | ties_mean | ties_max
+merge_func: "signmax"         # Basic: sum | mean | max | signmax | random
+                              # TIES: ties_sum | ties_mean | ties_max
+                              # EMA: ema
+                              # Advanced: energy_equalize | variance_aware | subspace_whiten | conflict_gating
+                              #           elect_then_avg | soft_signmax | signmax_mad_normalized | align_weighted_mean
+                              #           coherence_penalized | orthogonal_deflation | odm_ema_tuning_free
+                              # TSV-Merge Inspired:
+                              #   consensus_whiten: Best balance (keeps consensus, orthogonalizes conflicts)
+                              #   spectral_denoise: Best for high noise / 10+ tasks (SVD filtering)
+                              #   geometric_median: Best for outlier rejection (robust statistics)
+                              #   stack_whiten_procrustes: Maximum interference reduction (SVD-based)
+                              #   stack_whiten_newton: Same as procrustes but faster (SVD-free)
 align_mode: "none"            # none | ties | tadrop
 
 # ============================================================================
@@ -137,13 +148,43 @@ tadrop_tau: 0.0               # Task Arithmetic dropout threshold
 # ============================================================================
 # TSV-Style Linear/Non-Linear Separation
 # ============================================================================
-only_project_linear: false    # If true, only 2D tensors are projected; 1D tensors merged with mean in original space
-                              # This mimics TSV behavior: linear layers (weights) use subspace, non-linear (biases, norms) use mean
+only_project_linear: false    # If true, only 2D tensors are projected; 1D tensors merged in original space
+                              # This mimics TSV behavior: linear layers (weights) use subspace, non-linear (biases, norms) use original space
+
+# Non-linear weight merging mode (active when only_project_linear=true)
+nonlinear_merge_mode: "mean"  # mean | drop | sum | max | signmax
+                              # - mean: Average of task vectors (original behavior, stable)
+                              # - drop: Drop to zero (no update for non-linear params)
+                              # - sum: Sum of task vectors with optional scaling
+                              # - max: Max magnitude task vector
+                              # - signmax: Majority sign, then max magnitude (TIES-like for non-linear)
+
+nonlinear_scale: 1.0          # Scaling factor for non-linear weights (applies to all modes except drop)
+                              # Useful with mode="sum" to control contribution
+
+separate_norm_layers: false   # If true, normalization layers (BatchNorm, LayerNorm, etc.) are separated
+                              # from other non-linear weights and merged using norm_merge_mode
+                              # Non-norm non-linear weights use nonlinear_merge_mode
+
+norm_merge_mode: "mean"       # mean | drop | sum | max | signmax (active when separate_norm_layers=true)
+                              # Merging mode for normalization layers (BatchNorm, LayerNorm, GroupNorm, etc.)
+                              # - mean: Average of task vectors (default, recommended for stability)
+                              # - drop: Drop to zero (no update for norm params)
+                              # - sum: Sum of task vectors with nonlinear_scale
+                              # - max: Max magnitude task vector
+                              # - signmax: Majority sign, then max magnitude
 
 # ============================================================================
 # Embedding Layer Control
 # ============================================================================
 project_embeddings: true      # If false, embedding layers are excluded from projection and merged in original space
+
+# ============================================================================
+# MLP Layer Control
+# ============================================================================
+drop_mlp_update: false        # If true, exclude MLP layers from task vector merging
+                              # MLP weights will remain at pretrained values (no task updates applied)
+                              # Applies to keys containing 'mlp', 'fc', 'ffn', 'feed_forward', 'c_fc', 'c_proj'
                               # Embedding layers are detected by name patterns: position_embedding, pos_embed, patch_embed, 
                               # token_embedding, cls_token, mask_token, decoder_embed, text_projection, etc.
                               # Use case: Embeddings often have distinct representations that may not benefit from projection
@@ -159,6 +200,14 @@ use_pareto: false             # Apply Pareto frontier optimization
 use_rescale: false            # Rescale merged parameters
 weights: null                 # Task importance weights [w1, w2, ..., wN]
 scale: 1.0                    # Global scaling factor
+
+# ============================================================================
+# Decision Tracking Options (for max/signmax aggregation)
+# ============================================================================
+log_max_decision: false      # Track which task wins how many decisions (absolute and relative)
+                             # Only active when merge_func is "max" or "signmax"
+                             # Tracks wins at layer level and globally
+                             # Results saved to decision_statistics.json and included in output files
 
 # ============================================================================
 # Integrated Analysis Options
@@ -276,3 +325,26 @@ consensus_threshold: 2        # Minimum number of tasks that must activate a par
                               # - 2: Remove catastrophic + selfish weights (default, recommended)
                               # - 3+: Increasingly strict (only keep highly shared parameters)
                               # - >num_tasks: Remove everything (not useful)
+
+# ============================================================================
+# Iso-Merging Parameters (Isotropic Model Merging)
+# ============================================================================
+use_iso_preprocessing: false  # Apply Iso-C scaling to each task vector BEFORE projection/merging
+                              # Iso-C makes singular value spectrum uniform for each task vector
+                              # Applied individually: τ_i = Iso(θ_i - θ_base) for each task i
+                              # Then task vectors are projected and merged as usual
+                              # Compatible with all merge functions and projection modes
+use_iso_postprocessing: false # Apply Iso-C scaling to merged task vector AFTER merging
+                              # Makes the final merged task vector's spectrum uniform
+                              # Applied to: τ_merged = Iso(merged task vector)
+                              # Then applied to base: θ_final = θ_base + τ_merged
+                              # Applied BEFORE Subspace Boosting, LiNeS, and Consensus Mask
+                              # Compatible with all merge functions
+# Note: Both can be enabled simultaneously for double Iso-C application
+# Iso-C Algorithm (from "No Task Left Behind" paper):
+#   1. Compute SVD: T = U Σ V^T
+#   2. Replace singular values with mean: Σ' = mean(Σ) * I
+#   3. Reconstruct: T' = U Σ' V^T
+# This prevents a few dominant singular values from dominating the merge
+# Reference: Marczak et al., "No Task Left Behind: Isotropic Model Merging
+#            with Common and Task-Specific Subspaces", ICML 2025
